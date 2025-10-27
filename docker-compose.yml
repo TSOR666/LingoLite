@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  lingolite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lingolite
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+      - ./tokenizer:/app/tokenizer
+    environment:
+      - MODEL_SIZE=small
+      - DEVICE=cuda
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Optional: Redis for caching
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: lingolite-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   restart: unless-stopped
+
+# volumes:
+#   redis-data:

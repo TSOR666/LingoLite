@@ -1,0 +1,36 @@
+# Mobile Translation Model - Requirements
+# All improvements work with these dependencies
+
+# Core dependencies
+torch>=2.0.0
+sentencepiece>=0.1.99
+numpy>=1.24.0
+
+# Training and evaluation
+sacrebleu>=2.3.1
+tqdm>=4.65.0
+
+# API Server (optional, for deployment)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Optional: For mixed precision training (recommended)
+# No additional packages needed - uses torch.cuda.amp
+
+# Optional: For exporting to mobile
+# onnx>=1.14.1
+# onnxruntime>=1.16.0
+# onnx-tf>=1.10.0
+# tensorflow>=2.12.0
+# coremltools>=6.2.0
+
+# Development (optional but recommended for testing)
+pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
+
+# Note: The improvements (utils.py, generation_utils.py) only require:
+# - torch (already listed)
+# - Python standard library (logging, ast, pathlib, dataclasses, time, sys)
+# No additional dependencies needed!

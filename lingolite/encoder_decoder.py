@@ -1,0 +1,440 @@
+"""
+Encoder-Decoder Architecture for Translation
+Mobile-optimized transformer with GQA, RoPE, and SwiGLU
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple, List, TYPE_CHECKING
+from .model_components import (
+    RMSNorm,
+    RotaryPositionEmbedding,
+    GroupedQueryAttention,
+    SwiGLU_FFN
+)
+
+try:
+    from .generation_utils import LayerKVCache  # type: ignore
+except ImportError:  # pragma: no cover - generation utils optional during some installs
+    LayerKVCache = None
+if TYPE_CHECKING:
+    from .generation_utils import LayerKVCache
+
+
+class EncoderLayer(nn.Module):
+    """
+    Single Transformer Encoder Layer.
+    
+    Architecture:
+        x = x + SelfAttention(Norm(x))
+        x = x + FFN(Norm(x))
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int,
+        d_ff: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        # Self-attention (bidirectional for encoder)
+        self.self_attn = GroupedQueryAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            dropout=dropout,
+            is_causal=False,  # Bidirectional
+        )
+        
+        # Feed-forward network
+        self.ffn = SwiGLU_FFN(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        
+        # Layer normalization
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        rope: Optional[RotaryPositionEmbedding] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            attention_mask: (batch, 1, seq_len, seq_len)
+            rope: RoPE instance
+
+        Returns:
+            output: (batch, seq_len, d_model)
+        """
+        # Self-attention with pre-norm
+        residual = x
+        x = self.norm1(x)
+        x, _ = self.self_attn(x, attention_mask=attention_mask, rope=rope, use_cache=False)
+        x = self.dropout(x)
+        x = residual + x
+
+        # Feed-forward with pre-norm
+        residual = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = residual + x
+
+        return x
+
+
+class DecoderLayer(nn.Module):
+    """
+    Single Transformer Decoder Layer.
+    
+    Architecture:
+        x = x + MaskedSelfAttention(Norm(x))
+        x = x + CrossAttention(Norm(x), encoder_output)
+        x = x + FFN(Norm(x))
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int,
+        d_ff: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        # Masked self-attention (causal)
+        self.self_attn = GroupedQueryAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            dropout=dropout,
+            is_causal=True,  # Causal masking
+        )
+        
+        # Cross-attention to encoder
+        self.cross_attn = GroupedQueryAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            dropout=dropout,
+            is_causal=False,
+            is_cross_attn=True,
+        )
+        
+        # Feed-forward network
+        self.ffn = SwiGLU_FFN(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        
+        # Layer normalization
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.norm3 = RMSNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        encoder_output: torch.Tensor,
+        self_attention_mask: Optional[torch.Tensor] = None,
+        cross_attention_mask: Optional[torch.Tensor] = None,
+        rope: Optional[RotaryPositionEmbedding] = None,
+        layer_cache: Optional['LayerKVCache'] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional['LayerKVCache']]:
+        """
+        Args:
+            x: (batch, tgt_len, d_model)
+            encoder_output: (batch, src_len, d_model)
+            self_attention_mask: (batch, 1, tgt_len, tgt_len)
+            cross_attention_mask: (batch, 1, tgt_len, src_len)
+            rope: RoPE instance
+            layer_cache: Optional LayerKVCache for this layer
+            use_cache: Whether to return updated cache
+
+        Returns:
+            output: (batch, tgt_len, d_model)
+            updated_cache: Updated LayerKVCache if use_cache=True, else None
+        """
+        # Initialize cache if needed
+        if use_cache and layer_cache is None:
+            from .generation_utils import LayerKVCache
+            layer_cache = LayerKVCache()
+
+        # Masked self-attention with pre-norm
+        residual = x
+        x = self.norm1(x)
+        past_self = None
+        if layer_cache is not None and layer_cache.self_attn_cache.key is not None:
+            past_self = (
+                layer_cache.self_attn_cache.key,
+                layer_cache.self_attn_cache.value,
+            )
+
+        x, self_attn_cache = self.self_attn(
+            x,
+            attention_mask=self_attention_mask,
+            rope=rope,
+            kv_cache=layer_cache.self_attn_cache if layer_cache else None,
+            use_cache=use_cache,
+        )
+        x = self.dropout(x)
+        x = residual + x
+
+        # Update self-attention cache
+        if use_cache and self_attn_cache is not None:
+            layer_cache.self_attn_cache = self_attn_cache
+
+        # Cross-attention with pre-norm
+        residual = x
+        x = self.norm2(x)
+        past_cross = None
+        if layer_cache is not None and layer_cache.cross_attn_cache.key is not None:
+            past_cross = (
+                layer_cache.cross_attn_cache.key,
+                layer_cache.cross_attn_cache.value,
+            )
+
+        x, cross_attn_cache = self.cross_attn(
+            query=x,
+            key=encoder_output,
+            value=encoder_output,
+            attention_mask=cross_attention_mask,
+            rope=None,  # Don't apply RoPE to cross-attention
+            kv_cache=layer_cache.cross_attn_cache if layer_cache else None,
+            use_cache=use_cache,
+        )
+        x = self.dropout(x)
+        x = residual + x
+
+        # Update cross-attention cache
+        if use_cache and cross_attn_cache is not None:
+            layer_cache.cross_attn_cache = cross_attn_cache
+
+        # Feed-forward with pre-norm
+        residual = x
+        x = self.norm3(x)
+        x = self.ffn(x)
+        x = residual + x
+
+        return x, layer_cache if use_cache else None
+
+
+class TransformerEncoder(nn.Module):
+    """
+    Stack of Encoder Layers with embeddings.
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        n_kv_heads: int,
+        d_ff: int,
+        max_seq_len: int = 512,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        self.d_model = d_model
+        
+        # Token embeddings
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Rotary position embeddings
+        self.rope = RotaryPositionEmbedding(
+            dim=d_model // n_heads,
+            max_seq_len=max_seq_len
+        )
+        
+        # Encoder layers
+        self.layers = nn.ModuleList([
+            EncoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                d_ff=d_ff,
+                dropout=dropout,
+            )
+            for _ in range(n_layers)
+        ])
+        
+        # Final normalization
+        self.final_norm = RMSNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len) - 1 for real tokens, 0 for padding
+        
+        Returns:
+            encoder_output: (batch, seq_len, d_model)
+        """
+        # Embed tokens
+        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        x = self.dropout(x)
+        
+        # Create attention mask for padding
+        if attention_mask is not None:
+            # Convert to (batch, 1, 1, seq_len) for broadcasting
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            # Convert 0/1 to -inf/0 for masking
+            attention_mask = (1.0 - attention_mask) * -10000.0
+        
+        # Apply encoder layers
+        for layer in self.layers:
+            x = layer(x, attention_mask=attention_mask, rope=self.rope)
+        
+        # Final normalization
+        x = self.final_norm(x)
+        
+        return x
+
+
+class TransformerDecoder(nn.Module):
+    """
+    Stack of Decoder Layers with embeddings and output projection.
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        n_kv_heads: int,
+        d_ff: int,
+        max_seq_len: int = 512,
+        dropout: float = 0.1,
+        tie_embeddings: bool = True,
+    ):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.tie_embeddings = tie_embeddings
+        
+        # Token embeddings
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Rotary position embeddings
+        self.rope = RotaryPositionEmbedding(
+            dim=d_model // n_heads,
+            max_seq_len=max_seq_len
+        )
+        
+        # Decoder layers
+        self.layers = nn.ModuleList([
+            DecoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                d_ff=d_ff,
+                dropout=dropout,
+            )
+            for _ in range(n_layers)
+        ])
+        
+        # Final normalization
+        self.final_norm = RMSNorm(d_model)
+        
+        # Output projection
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Weight tying (share embeddings with output)
+        if tie_embeddings:
+            self.lm_head.weight = self.embedding.weight
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        encoder_output: torch.Tensor,
+        self_attention_mask: Optional[torch.Tensor] = None,
+        cross_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List['LayerKVCache']] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[List['LayerKVCache']]]:
+        """
+        Args:
+            input_ids: (batch, tgt_len)
+            encoder_output: (batch, src_len, d_model)
+            self_attention_mask: (batch, tgt_len) - for padding
+            cross_attention_mask: (batch, src_len) - for encoder padding
+            past_key_values: Optional list of LayerKVCache for each layer
+            use_cache: Whether to return updated cache
+
+        Returns:
+            logits: (batch, tgt_len, vocab_size)
+            updated_caches: List of LayerKVCache if use_cache=True, else None
+        """
+        # Embed tokens
+        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        x = self.dropout(x)
+
+        # Create self-attention mask (causal mask is handled in layer)
+        if self_attention_mask is not None:
+            self_attention_mask = self_attention_mask.unsqueeze(1).unsqueeze(2)
+            self_attention_mask = (1.0 - self_attention_mask) * -10000.0
+
+        # Create cross-attention mask
+        if cross_attention_mask is not None:
+            cross_attention_mask = cross_attention_mask.unsqueeze(1).unsqueeze(2)
+            cross_attention_mask = (1.0 - cross_attention_mask) * -10000.0
+        
+        if use_cache:
+            if LayerKVCache is None:
+                raise RuntimeError("LayerKVCache is unavailable; ensure generation_utils is imported")
+            if past_key_values is None:
+                past_key_values = [LayerKVCache() for _ in self.layers]
+            elif len(past_key_values) != len(self.layers):
+                raise ValueError(
+                    f"Expected {len(self.layers)} past key values, got {len(past_key_values)}"
+                )
+
+        # Initialize caches list if needed
+        updated_caches = [] if use_cache else None
+
+        # Apply decoder layers
+        for i, layer in enumerate(self.layers):
+            layer_cache = past_key_values[i] if past_key_values else None
+            x, new_cache = layer(
+                x,
+                encoder_output=encoder_output,
+                self_attention_mask=self_attention_mask,
+                cross_attention_mask=cross_attention_mask,
+                rope=self.rope,
+                layer_cache=layer_cache,
+                use_cache=use_cache,
+            )
+
+            if use_cache:
+                updated_caches.append(new_cache)
+
+        # Final normalization and projection
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+
+        return logits, updated_caches
+
+
+# Test encoder and decoder
+if __name__ == "__main__":
+    pass

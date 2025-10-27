@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lingolite"
+version = "0.1.0"
+description = "LingoLite: Mobile-optimized neural machine translation framework"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{ name = "Thierry Silvio Claude Soreze" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  "torch>=2.0.0",
+  "sentencepiece>=0.1.99",
+  "numpy>=1.24.0",
+  "sacrebleu>=2.3.1",
+  "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.104.0",
+  "uvicorn[standard]>=0.24.0",
+  "pydantic>=2.0.0",
+]
+dev = [
+  "pytest>=7",
+  "flake8>=6.0.0",
+  "black>=23.0.0",
+]
+export = [
+  "onnx>=1.14.1",
+  "onnxruntime>=1.16.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/LingoLite"
+Issues = "https://github.com/your-org/LingoLite/issues"
+
+[project.scripts]
+lingolite-train = "lingolite.training:main"
+lingolite-api = "scripts.api_server:main"
+
+[tool.setuptools.packages.find]
+include = ["lingolite*", "scripts*"]
+namespaces = false
+
