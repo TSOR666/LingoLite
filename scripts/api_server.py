@@ -35,9 +35,14 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# CORS configuration - can be restricted via environment variable
+# For production, set LINGOLITE_ALLOWED_ORIGINS="https://yourdomain.com,https://anotherdomain.com"
+allowed_origins_env = os.getenv("LINGOLITE_ALLOWED_ORIGINS", "*")
+allowed_origins = allowed_origins_env.split(",") if allowed_origins_env != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

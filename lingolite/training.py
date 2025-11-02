@@ -15,11 +15,16 @@ from typing import Dict, List, Optional, Tuple
 import json
 import argparse
 import sys
+import logging
 from tqdm import tqdm
 import random
 
 from .mobile_translation_model import MobileTranslationModel, create_model
 from .translation_tokenizer import TranslationTokenizer
+from .utils import setup_logger
+
+# Set up logger
+logger = setup_logger(name="lingolite_training", level=logging.INFO)
 
 
 class TranslationDataset(Dataset):
@@ -48,7 +53,16 @@ class TranslationDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        
+
+        # Validate required fields
+        required_fields = ['src_text', 'tgt_text', 'src_lang', 'tgt_lang']
+        missing_fields = [field for field in required_fields if field not in item]
+        if missing_fields:
+            raise ValueError(
+                f"Dataset item at index {idx} is missing required fields: {missing_fields}. "
+                f"Expected format: {{'src_text': str, 'tgt_text': str, 'src_lang': str, 'tgt_lang': str}}"
+            )
+
         # Tokenize source
         src_ids = self.tokenizer.encode(
             text=item['src_text'],
@@ -57,7 +71,7 @@ class TranslationDataset(Dataset):
             add_special_tokens=True,
             max_length=self.max_length,
         )
-        
+
         # Tokenize target (format: <tgt_lang> text </s>)
         tgt_text = item['tgt_text']
         tgt_ids = self.tokenizer.encode(
@@ -462,7 +476,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """Command-line interface for model training."""
 
     parser = build_arg_parser()
@@ -471,12 +485,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Validate required files exist
     train_data_path = Path(args.train_data)
     if not train_data_path.exists():
-        print(f"Error: Training data not found at {args.train_data}")
+        logger.error(f"Training data not found at {args.train_data}")
         sys.exit(1)
 
     tokenizer_path = Path(args.tokenizer_path)
     if not tokenizer_path.exists():
-        print(f"Error: Tokenizer not found at {args.tokenizer_path}")
+        logger.error(f"Tokenizer not found at {args.tokenizer_path}")
         print("\nTo train a tokenizer, use:")
         print("  from lingolite.translation_tokenizer import TranslationTokenizer")
         print("  tokenizer = TranslationTokenizer(languages=['en', 'es', 'fr'])")
@@ -484,21 +498,27 @@ def main(argv: Optional[list[str]] = None) -> None:
         print("  tokenizer.save('./tokenizer')")
         sys.exit(1)
 
-    print("=" * 80)
-    print("LINGOLITE TRAINING")
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("LINGOLITE TRAINING")
+    logger.info("=" * 80)
 
     # Load tokenizer
-    print("\nLoading tokenizer...")
+    logger.info("Loading tokenizer...")
     tokenizer = TranslationTokenizer.from_pretrained(str(tokenizer_path))
     vocab_size = args.vocab_size or tokenizer.get_vocab_size()
-    print(f"✓ Tokenizer loaded: vocab_size={vocab_size}")
+
+    # Validate vocab_size
+    if vocab_size <= 0:
+        logger.error(f"Invalid vocabulary size: {vocab_size}. Tokenizer may not be properly initialized.")
+        sys.exit(1)
+
+    logger.info(f"Tokenizer loaded: vocab_size={vocab_size}")
 
     # Load training data
-    print(f"\nLoading training data from {args.train_data}...")
+    logger.info(f"Loading training data from {args.train_data}...")
     with open(args.train_data, 'r') as f:
         train_data = json.load(f)
-    print(f"✓ Loaded {len(train_data)} training examples")
+    logger.info(f"Loaded {len(train_data)} training examples")
 
     # Load validation data
     val_loader = None
