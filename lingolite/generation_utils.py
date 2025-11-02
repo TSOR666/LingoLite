@@ -226,16 +226,11 @@ class BeamSearchScorer:
             # Check if this batch is done
             finished_count = len(self.finished_hypotheses[batch_idx])
 
+            # Mark batch done as soon as we have num_beams finished hypotheses,
+            # regardless of early_stopping flag. This prevents endless decoding
+            # when a sufficient number of hypotheses are complete.
             if finished_count >= num_beams:
-                if self.early_stopping:
-                    # Strict early stopping: stop as soon as we have num_beams hypotheses
-                    self.done[batch_idx] = True
-                else:
-                    # When early stopping is disabled, only stop once all beams
-                    # emit EOS (no active hypotheses remain).
-                    all_finished = bool(batch_eos_mask.all().item())
-                    if all_finished:
-                        self.done[batch_idx] = True
+                self.done[batch_idx] = True
 
         return input_ids, next_scores, self.done
     
@@ -394,11 +389,15 @@ def generate_with_kv_cache(
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 next_token_logits = next_token_logits.masked_fill(indices_to_remove, float('-inf'))
 
-            probs = F.softmax(next_token_logits, dim=-1)
-            if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
+            # Check for invalid logits before softmax (e.g., all -inf)
+            if torch.isinf(next_token_logits).all(dim=-1).any() or torch.isnan(next_token_logits).any():
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
             else:
-                next_token = torch.multinomial(probs, num_samples=1)
+                probs = F.softmax(next_token_logits, dim=-1)
+                if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
+                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                else:
+                    next_token = torch.multinomial(probs, num_samples=1)
 
             next_token = torch.where(
                 finished.unsqueeze(1),

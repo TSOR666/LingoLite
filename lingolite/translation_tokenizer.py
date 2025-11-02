@@ -212,7 +212,7 @@ class TranslationTokenizer:
             tokens = []
 
             if bool(src_lang) ^ bool(tgt_lang):
-                raise ValueError("Both 'src_lang' and 'tgt_lang' must be provided together.")
+                raise ValueError("Either both 'src_lang' and 'tgt_lang' must be provided together, or neither should be provided.")
 
             # Translation format: <src> <lang> text </s> <tgt> <lang>
             if src_lang and tgt_lang:

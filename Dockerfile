@@ -25,9 +25,11 @@ ENV PYTHONUNBUFFERED=1
 ENV MODEL_SIZE=small
 ENV DEVICE=cpu
 
-# Health check
+# Health check - verify API server is healthy (if running)
+# Falls back to checking torch import if API server is not running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import torch; import sys; sys.exit(0)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || \
+        python -c "import torch; import sys; sys.exit(0)" || exit 1
 
 # Expose port for API server (when implemented)
 EXPOSE 8000
