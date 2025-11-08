@@ -529,7 +529,7 @@ The evaluation suite provides:
 - **Memory profiling**: Peak memory usage during inference
 - **Error analysis**: Common failure patterns and edge cases
 
-See [EVALUATION_REPORT.md](docs/reports/EVALUATION_REPORT.md) for comprehensive benchmark results.
+See [COMMUNITY_DEPLOYMENT_REVIEW.md](docs/reports/COMMUNITY_DEPLOYMENT_REVIEW.md) for the latest community deployment checklist and verification notes.
 
 ## Training
 
@@ -746,7 +746,7 @@ LingoLite implements comprehensive security measures:
 - **Token ID Validation**: Prevents out-of-bounds access
 - **No Code Execution**: Pure data processing, no eval() or exec()
 
-See `AUDIT_REPORT.md` for detailed security audit results.
+See [SECURITY.md](docs/policies/SECURITY.md) for detailed security policies and audit guidance.
 
 ## Performance
 
@@ -873,13 +873,13 @@ Comprehensive documentation is available:
 
 - **[README.md](README.md)** - Quick start guide and API reference (this file)
 - **[PRODUCTION_READINESS.md](docs/reports/PRODUCTION_READINESS.md)** - **START HERE: Honest assessment of current state**
+- **[OPEN_SOURCE_READINESS_REPORT.md](docs/reports/OPEN_SOURCE_READINESS_REPORT.md)** - Open source release checklist and legal verification
+- **[COMMUNITY_DEPLOYMENT_REVIEW.md](docs/reports/COMMUNITY_DEPLOYMENT_REVIEW.md)** - Deployment & training readiness review for contributors
 - **[SECURITY.md](docs/policies/SECURITY.md)** - Security policy and vulnerability reporting
 - **[CHANGELOG.md](docs/reference/CHANGELOG.md)** - Version history and release notes
 - **[CONTRIBUTING.md](docs/policies/CONTRIBUTING.md)** - Contribution guidelines and development setup
 - **[CODE_OF_CONDUCT.md](docs/policies/CODE_OF_CONDUCT.md)** - Community guidelines
 - **[DEPLOYMENT_GUIDE.md](docs/guides/DEPLOYMENT_GUIDE.md)** - Deployment instructions (requires trained model)
-- **[EVALUATION_REPORT.md](docs/reports/EVALUATION_REPORT.md)** - Evaluation scripts and utilities
-- **[AUDIT_REPORT.md](docs/reports/AUDIT_REPORT.md)** - Security audit documentation
 - **[IMPROVEMENTS.md](docs/reports/IMPROVEMENTS.md)** - Recent improvements and changes
 - **[scripts/examples.py](scripts/examples.py)** - Code examples and usage patterns
 

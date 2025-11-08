@@ -733,7 +733,7 @@ translations = tokenizer.batch_decode(outputs.tolist())
 For issues and questions:
 
 - **GitHub Issues:** https://github.com/TSOR666/LingoLite/issues
-- **Documentation:** See README.md, AUDIT_REPORT.md, EVALUATION_REPORT.md
+- **Documentation:** See README.md, SECURITY.md, COMMUNITY_DEPLOYMENT_REVIEW.md
 - **Examples:** See scripts/examples.py
 
 ---
