@@ -91,11 +91,11 @@ Version 1.0.0 will be released when:
 
 ## Contributing
 
-See [CONTRIBUTING.md](docs/policies/CONTRIBUTING.md) for guidelines on proposing changes and submitting pull requests.
+See [CONTRIBUTING.md](../policies/CONTRIBUTING.md) for guidelines on proposing changes and submitting pull requests.
 
 ## Security
 
-See [SECURITY.md](docs/policies/SECURITY.md) for information on reporting vulnerabilities.
+See [SECURITY.md](../policies/SECURITY.md) for information on reporting vulnerabilities.
 
 ---
 

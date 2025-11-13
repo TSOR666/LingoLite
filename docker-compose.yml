@@ -12,8 +12,9 @@ services:
       - ./checkpoints:/app/checkpoints
       - ./tokenizer:/app/tokenizer
     environment:
-      - MODEL_SIZE=small
-      - DEVICE=cuda
+      - LINGOLITE_MODEL_SIZE=small
+      - LINGOLITE_DEVICE=cuda
+      - LINGOLITE_ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
     ports:

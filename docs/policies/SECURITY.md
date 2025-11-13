@@ -1,1 +1,93 @@
-# Security Policy## Supported VersionsLingoLite is currently in active development. Security updates will be provided for the latest version on the `main` branch.| Version | Supported          || ------- | ------------------ || main    | :white_check_mark: || < 1.0   | :x:                |## Reporting a VulnerabilityWe take security vulnerabilities seriously. If you discover a security issue in LingoLite, please report it responsibly.### How to Report**Please DO NOT report security vulnerabilities through public GitHub issues.**Instead, please report them via one of the following methods:1. **GitHub Security Advisories** (Preferred):   - Go to the [Security Advisories page](../../security/advisories)   - Click "Report a vulnerability"   - Provide detailed information about the vulnerability2. **Email**:   - Send details to the repository owner via GitHub   - Include "SECURITY" in the subject line   - Provide a detailed description of the vulnerability### What to IncludeWhen reporting a vulnerability, please include:- **Description**: Clear description of the vulnerability- **Impact**: What an attacker could potentially do- **Reproduction**: Step-by-step instructions to reproduce the issue- **Affected versions**: Which versions are affected- **Suggested fix** (optional): If you have ideas for how to fix it### What to Expect- **Acknowledgment**: We will acknowledge receipt within 48 hours- **Updates**: We will provide updates on our progress every 7 days- **Timeline**: We aim to:  - Validate the report within 7 days  - Develop a fix within 30 days for critical issues  - Publish a security advisory and release a patch### Disclosure Policy- Please give us reasonable time to fix the vulnerability before public disclosure- We will coordinate with you on the disclosure timeline- We will credit you in the security advisory (unless you prefer to remain anonymous)## Security Best Practices### For UsersWhen using LingoLite:1. **Keep Dependencies Updated**   ```bash   pip install -e .[api,dev] --upgrade   ```2. **Validate Model Checkpoints**   - Only load model checkpoints from trusted sources   - Be cautious when loading user-provided models (potential for malicious code execution)3. **API Server Security**   - Use HTTPS in production (not HTTP)   - Configure CORS appropriately (don't use `allow_origins=["*"]` in production)   - Implement rate limiting   - Use authentication/authorization for production deployments   - Set appropriate resource limits (max_length, batch_size)4. **Input Validation**   - LingoLite includes input validation, but always sanitize user inputs   - Be aware of prompt injection attacks if exposing translation to untrusted users5. **Environment Variables**   - Never commit `.env` files with secrets   - Use strong, unique credentials for any services   - Rotate credentials regularly### For ContributorsWhen contributing to LingoLite:1. **No Hardcoded Secrets**   - Never commit API keys, passwords, or tokens   - Use environment variables or secure credential management2. **Input Validation**   - Always validate user inputs   - Check types, ranges, and formats   - Use the `InputValidator` class in `lingolite/utils.py`3. **Path Traversal Protection**   - Use `Path.resolve()` to canonicalize paths   - Validate that paths don't escape intended directories   - See `lingolite/utils.py` for examples4. **Dependency Security**   - Only add well-maintained dependencies   - Check for known vulnerabilities: `pip-audit`   - Pin versions in `requirements.txt`5. **Code Review**   - All changes require review before merging   - Security-sensitive changes require extra scrutiny   - Run security checks locally before submitting PRs## Known Security Considerations### Model Loading**Risk**: Loading untrusted model checkpoints can execute arbitrary code (PyTorch pickle vulnerability)**Mitigation**:- Only load models from trusted sources- Consider using `torch.load(..., weights_only=True)` in PyTorch 2.0+- Implement model signature verification for production### API Server**Current State**: The API server is designed for development/research use**Production Requirements**:- [ ] Add authentication (JWT, API keys, OAuth)- [ ] Implement rate limiting- [ ] Add request logging and monitoring- [ ] Configure CORS restrictively- [ ] Use HTTPS/TLS- [ ] Add input sanitization for all endpoints- [ ] Implement resource quotas per user### Tokenizer Training**Risk**: Training tokenizers on untrusted data could include malicious tokens**Mitigation**:- Validate and sanitize training data- Review tokenizer vocabulary before deployment- Use character coverage limits## Security Audit History| Date | Auditor | Scope | Status ||------|---------|-------|--------|| 2025-10-27 | Internal | Codebase scan for secrets, validation | ✅ Pass || 2025-10-27 | Internal | Dependency review | ✅ Pass |See [AUDIT_REPORT.md](docs/reports/AUDIT_REPORT.md) for detailed audit findings.## Security-Related Configuration### Recommended Production Settings```python# API ServerCORS_ORIGINS = ["https://yourdomain.com"]  # Not "*"MAX_REQUEST_SIZE = 5000  # Character limitRATE_LIMIT = "100/hour"  # Requests per hourREQUIRE_AUTH = True# ModelMAX_LENGTH = 512  # Limit generation lengthBATCH_SIZE = 32  # Limit batch sizeTIMEOUT = 30  # Request timeout in seconds```## Additional Resources- [OWASP Top 10](https://owasp.org/www-project-top-ten/)- [PyTorch Security Best Practices](https://pytorch.org/docs/stable/notes/serialization.html#saving-and-loading-tensors-preserves-device)- [FastAPI Security](https://fastapi.tiangolo.com/tutorial/security/)## ContactFor security-related questions that don't involve a vulnerability, please open a GitHub discussion or issue.---**Last Updated**: October 27, 2025
+# LingoLite Security Policy
+
+_Last updated: November 13, 2025_
+
+## Supported Versions
+
+| Version | Supported |
+| --- | --- |
+| `main` (latest development build) | Yes |
+| `< 1.0.0` tagged releases | No (development preview only) |
+
+Security fixes are provided on the active `main` branch until a stable release line is established.
+
+## Reporting a Vulnerability
+
+We take security issues seriously. **Please do not open public GitHub issues for vulnerabilities.**
+
+Report privately using one of the following channels:
+
+1. **GitHub Security Advisories (preferred)**  
+   - Navigate to the repository's Security -> Advisories page  
+   - Click "Report a vulnerability" and include reproduction details
+2. **Email**  
+   - Send a message to the maintainer listed in `pyproject.toml` via GitHub  
+   - Use the subject line `SECURITY REPORT: <short summary>`  
+
+### What to Include
+- Description of the issue and potential impact
+- Step-by-step reproduction instructions
+- Affected versions or commit SHAs
+- Suggested remediation ideas (optional)
+- Whether you prefer public credit in advisories
+
+### Coordinated Disclosure Process
+1. We acknowledge new reports within **48 hours**
+2. We aim to validate the issue within **7 days**
+3. Critical fixes target a **30-day** remediation window
+4. Once a fix is available, we will coordinate disclosure timing with the reporter
+
+## Security Best Practices
+
+### For Users & Deployers
+- **Keep dependencies current**: `pip install -e .[api,dev] --upgrade`
+- **Use trusted checkpoints** only; untrusted PyTorch checkpoints can execute arbitrary code
+- **Run the API server behind HTTPS** with proper authentication and rate limiting
+- Restrict CORS origins (see `LINGOLITE_ALLOWED_ORIGINS` in `scripts/api_server.py`)
+- Limit request sizes (`max_length`, `batch_size`) when exposing the API publicly
+- Store secrets in environment variables; never commit `.env` files
+
+### For Contributors
+- Do not commit credentials, access tokens, or API keys
+- Validate all external inputs (use `lingolite.utils.InputValidator`)
+- Resolve filesystem paths with `Path.resolve()` before reading/writing
+- Prefer well-maintained dependencies and run `pip-audit` before proposing new ones
+- Request focused security review for changes touching serialization, checkpoint loading, or network boundaries
+
+## Known Security Considerations
+
+| Component | Risk | Status |
+| --- | --- | --- |
+| PyTorch checkpoint loading | Pickle execution when loading arbitrary checkpoints | Mitigated via documentation; production deployers should implement signing |
+| FastAPI server | Ships without authentication and with permissive CORS for local dev | Documented limitation; production deployers must configure auth, HTTPS, and rate limiting |
+| Tokenizer training | Malicious corpora can poison vocabularies | Covered in docs; sanitize corpora before training |
+
+## Security Audit History
+
+| Date | Scope | Result |
+| --- | --- | --- |
+| 2025-10-27 | Codebase scan for secrets & validation | Yes Pass |
+| 2025-10-27 | Dependency review | Yes Pass |
+
+See [`docs/reports/OPEN_SOURCE_READINESS_REPORT.md`](../reports/OPEN_SOURCE_READINESS_REPORT.md) for details.
+
+## Recommended Production Configuration
+
+```python
+CORS_ORIGINS = ["https://yourdomain.com"]  # Never "*"
+MAX_REQUEST_SIZE = 5000                    # Characters
+RATE_LIMIT = "100/hour"
+REQUIRE_AUTH = True                        # Token/JWT/OAuth
+MAX_LENGTH = 512                           # Decoder cap
+BATCH_SIZE = 32                            # Prevent large fan-out
+TIMEOUT = 30                               # Seconds
+```
+
+## Additional Resources
+- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+- [PyTorch Serialization Guidance](https://pytorch.org/docs/stable/notes/serialization.html)
+- [FastAPI Security Best Practices](https://fastapi.tiangolo.com/advanced/security/)
+
+## Contact
+
+Questions that are not security vulnerabilities can be discussed via GitHub Discussions or Issues. For vulnerabilities, please use the private channels described above.

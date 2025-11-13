@@ -22,8 +22,9 @@ RUN mkdir -p /app/models /app/data /app/checkpoints /app/tokenizer
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV MODEL_SIZE=small
-ENV DEVICE=cpu
+ENV LINGOLITE_MODEL_SIZE=small
+ENV LINGOLITE_DEVICE=cpu
+ENV LINGOLITE_ALLOWED_ORIGINS="http://localhost,http://127.0.0.1"
 
 # Health check - verify API server is healthy (if running)
 # Falls back to checking torch import if API server is not running
