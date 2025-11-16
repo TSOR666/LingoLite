@@ -66,10 +66,18 @@ class RotaryPositionEmbedding(nn.Module):
         # Precompute cos and sin for efficiency
         self._precompute_freqs(max_seq_len)
     
-    def _precompute_freqs(self, seq_len: int):
-        """Precompute cos and sin for positions."""
-        positions = torch.arange(seq_len).float()
-        freqs = torch.outer(positions, self.inv_freq)  # (seq_len, dim//2)
+    def _precompute_freqs(self, seq_len: int, device: Optional[torch.device] = None):
+        """Precompute cos and sin for positions on the requested device."""
+        if device is None:
+            device = self.inv_freq.device
+
+        # Keep inv_freq on the same device as the cached tensors
+        if self.inv_freq.device != device:
+            self.register_buffer('inv_freq', self.inv_freq.to(device), persistent=False)
+
+        positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        inv_freq = self.inv_freq
+        freqs = torch.outer(positions, inv_freq)  # (seq_len, dim//2)
         
         # Compute cos and sin
         emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
@@ -107,14 +115,19 @@ class RotaryPositionEmbedding(nn.Module):
             seq_len = q.shape[-2]
 
         total_len = seq_len + offset
+        device = q.device
 
-        # Extend cache if needed
-        if total_len > self.cos_cached.shape[0]:
-            self._precompute_freqs(total_len)
+        # Extend or relocate cache if needed
+        if (
+            total_len > self.cos_cached.shape[0]
+            or self.cos_cached.device != device
+        ):
+            self._precompute_freqs(total_len, device=device)
+            self.max_seq_len = max(self.max_seq_len, total_len)
 
-        # Slice the portion of cos/sin we need for this offset
-        cos = self.cos_cached[offset:offset + seq_len].unsqueeze(0)
-        sin = self.sin_cached[offset:offset + seq_len].unsqueeze(0)
+        # Slice the portion of cos/sin we need for this offset and match dtype/device
+        cos = self.cos_cached[offset:offset + seq_len].unsqueeze(0).to(dtype=q.dtype, device=device)
+        sin = self.sin_cached[offset:offset + seq_len].unsqueeze(0).to(dtype=q.dtype, device=device)
         
         # Apply rotation
         q_rot = q * cos + self.rotate_half(q) * sin
