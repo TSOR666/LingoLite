@@ -83,6 +83,31 @@ class LayerKVCache:
         return self
 
 
+def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """
+    Apply nucleus (top-p) filtering to logits.
+
+    Tokens outside the cumulative probability mass are masked to -inf so they
+    never get sampled.
+    """
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be within (0, 1].")
+
+    if top_p >= 1.0:
+        return logits
+
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = False
+
+    indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+    indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+    return logits.masked_fill(indices_to_remove, float('-inf'))
+
+
 # ============================================================================
 # BEAM SEARCH
 # ============================================================================
@@ -330,6 +355,8 @@ def generate_with_kv_cache(
 
     if top_k is not None and top_k < 0:
         raise ValueError("top_k must be non-negative or None")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be within (0, 1].")
 
     temperature = max(0.01, float(temperature))
 
@@ -371,7 +398,7 @@ def generate_with_kv_cache(
 
             next_token_logits = logits[:, -1, :] / temperature
 
-            if top_k:
+            if top_k is not None and top_k > 0:
                 top_k_val = min(top_k, next_token_logits.shape[-1])
                 threshold = torch.topk(next_token_logits, top_k_val)[0][..., -1, None]
                 next_token_logits = next_token_logits.masked_fill(
@@ -379,15 +406,7 @@ def generate_with_kv_cache(
                 )
 
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                next_token_logits = next_token_logits.masked_fill(indices_to_remove, float('-inf'))
+                next_token_logits = _apply_top_p_filter(next_token_logits, top_p)
 
             # Check for invalid logits before softmax (e.g., all -inf)
             if torch.isinf(next_token_logits).all(dim=-1).any() or torch.isnan(next_token_logits).any():
