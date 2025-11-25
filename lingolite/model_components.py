@@ -79,24 +79,6 @@ class RotaryPositionEmbedding(nn.Module):
         inv_freq = self.inv_freq
         freqs = torch.outer(positions, inv_freq)  # (seq_len, dim//2)
         
-        # Compute cos and sin
-        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
-        
-        self.register_buffer('cos_cached', emb.cos(), persistent=False)
-        self.register_buffer('sin_cached', emb.sin(), persistent=False)
-    
-    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Rotate half the dimensions for RoPE.
-        [x1, x2, x3, x4] -> [-x3, -x4, x1, x2]
-        """
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat([-x2, x1], dim=-1)
-    
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
         seq_len: Optional[int] = None,
         offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
