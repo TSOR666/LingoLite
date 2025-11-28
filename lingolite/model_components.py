@@ -79,6 +79,24 @@ class RotaryPositionEmbedding(nn.Module):
         inv_freq = self.inv_freq
         freqs = torch.outer(positions, inv_freq)  # (seq_len, dim//2)
         
+        # Concatenate for efficient application
+        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
+        
+        # Register cos and sin as buffers
+        self.register_buffer('cos_cached', emb.cos(), persistent=False)
+        self.register_buffer('sin_cached', emb.sin(), persistent=False)
+    
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Rotate half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+    
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
         seq_len: Optional[int] = None,
         offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -89,6 +107,7 @@ class RotaryPositionEmbedding(nn.Module):
             q: Query tensor (..., seq_len, dim)
             k: Key tensor (..., seq_len, dim)
             seq_len: Sequence length (if None, use q.shape[-2])
+            offset: Position offset for cached KV generation
         
         Returns:
             Rotated q and k tensors
@@ -101,6 +120,7 @@ class RotaryPositionEmbedding(nn.Module):
 
         # Extend or relocate cache if needed
         if (
+            not hasattr(self, 'cos_cached') or 
             total_len > self.cos_cached.shape[0]
             or self.cos_cached.device != device
         ):
@@ -116,6 +136,16 @@ class RotaryPositionEmbedding(nn.Module):
         k_rot = k * cos + self.rotate_half(k) * sin
         
         return q_rot, k_rot
+    
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        seq_len: Optional[int] = None,
+        offset: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Alias for forward to support both calling conventions."""
+        return self.forward(q, k, seq_len=seq_len, offset=offset)
 
 
 class GroupedQueryAttention(nn.Module):
