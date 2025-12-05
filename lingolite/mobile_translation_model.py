@@ -3,13 +3,14 @@ Complete Mobile Translation Model
 Encoder-Decoder transformer optimized for mobile deployment
 """
 
+import math
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, List, Tuple
-import math
 
-from .encoder_decoder import TransformerEncoder, TransformerDecoder
+from .encoder_decoder import TransformerDecoder, TransformerEncoder
 from .translation_tokenizer import TranslationTokenizer
 from .utils import InputValidator, logger
 

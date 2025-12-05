@@ -20,7 +20,7 @@ class RMSNorm(nn.Module):
     Used in: LLaMA, Mistral, Gemma, etc.
     """
     
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
@@ -33,7 +33,9 @@ class RMSNorm(nn.Module):
             Normalized tensor (..., dim)
         """
         # Compute RMS
-        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        x_float = x.float()  # compute mean in float32 for stability under mixed precision
+        rms = torch.sqrt(torch.mean(x_float ** 2, dim=-1, keepdim=True) + self.eps)
+        rms = rms.to(dtype=x.dtype)
         
         # Normalize and scale
         x_normed = x / rms
@@ -52,8 +54,12 @@ class RotaryPositionEmbedding(nn.Module):
     
     Used in: GPT-NeoX, LLaMA, PaLM, GPT-J, etc.
     """
+
+    inv_freq: torch.Tensor
+    cos_cached: torch.Tensor
+    sin_cached: torch.Tensor
     
-    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -62,14 +68,18 @@ class RotaryPositionEmbedding(nn.Module):
         # Compute frequency bands
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.register_buffer('cos_cached', torch.empty(0), persistent=False)
+        self.register_buffer('sin_cached', torch.empty(0), persistent=False)
         
         # Precompute cos and sin for efficiency
         self._precompute_freqs(max_seq_len)
     
-    def _precompute_freqs(self, seq_len: int, device: Optional[torch.device] = None):
+    def _precompute_freqs(self, seq_len: int, device: Optional[torch.device] = None) -> None:
         """Precompute cos and sin for positions on the requested device."""
         if device is None:
             device = self.inv_freq.device
+        else:
+            device = torch.device(device)
 
         # Keep inv_freq on the same device as the cached tensors
         if self.inv_freq.device != device:
@@ -175,7 +185,7 @@ class GroupedQueryAttention(nn.Module):
         dropout: float = 0.0,
         is_causal: bool = False,
         is_cross_attn: bool = False,
-    ):
+    ) -> None:
         super().__init__()
         
         assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
@@ -224,8 +234,8 @@ class GroupedQueryAttention(nn.Module):
         batch, q_len, _ = query.shape
 
         # Always project queries
-        Q = self.q_proj(query)
-        Q = Q.view(batch, q_len, self.n_heads, self.head_dim).transpose(1, 2)
+        Q = self.q_proj(query)  # (B, q_len, d_model) -> (B, q_len, n_heads * head_dim)
+        Q = Q.view(batch, q_len, self.n_heads, self.head_dim).transpose(1, 2)  # (B, q_len, n_heads * head_dim) -> (B, n_heads, q_len, head_dim)
 
         past_key = None
         past_value = None
@@ -246,11 +256,11 @@ class GroupedQueryAttention(nn.Module):
 
             kv_len = key.shape[1]
 
-            K = self.k_proj(key)
-            V = self.v_proj(value)
+            K = self.k_proj(key)  # (B, kv_len, d_model) -> (B, kv_len, n_kv_heads * head_dim)
+            V = self.v_proj(value)  # (B, kv_len, d_model) -> (B, kv_len, n_kv_heads * head_dim)
 
-            K = K.view(batch, kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-            V = V.view(batch, kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            K = K.view(batch, kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, kv_len, n_kv_heads * head_dim) -> (B, n_kv_heads, kv_len, head_dim)
+            V = V.view(batch, kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, kv_len, n_kv_heads * head_dim) -> (B, n_kv_heads, kv_len, head_dim)
 
             if rope is not None and not self.is_cross_attn:
                 past_len = 0 if past_key is None else past_key.shape[2]
@@ -260,12 +270,20 @@ class GroupedQueryAttention(nn.Module):
                 K = torch.cat([past_key, K], dim=2)
                 V = torch.cat([past_value, V], dim=2)
 
+        # Keep K/V aligned with the query for safe device/dtype usage
+        if K.device != query.device or V.device != query.device:
+            K = K.to(device=query.device)
+            V = V.to(device=query.device)
+        if K.dtype != Q.dtype or V.dtype != Q.dtype:
+            K = K.to(dtype=Q.dtype)
+            V = V.to(dtype=Q.dtype)
+
         present = (K, V) if use_cache else None
 
         # Repeat K and V to match the number of query heads
         if self.n_rep > 1:
-            K_for_scores = K.repeat_interleave(self.n_rep, dim=1)
-            V_for_scores = V.repeat_interleave(self.n_rep, dim=1)
+            K_for_scores = K.repeat_interleave(self.n_rep, dim=1)  # (B, n_kv_heads, kv_len, head_dim) -> (B, n_heads, kv_len, head_dim)
+            V_for_scores = V.repeat_interleave(self.n_rep, dim=1)  # (B, n_kv_heads, kv_len, head_dim) -> (B, n_heads, kv_len, head_dim)
         else:
             K_for_scores = K
             V_for_scores = V
@@ -273,7 +291,7 @@ class GroupedQueryAttention(nn.Module):
         kv_len = K_for_scores.shape[2]
 
         # Scaled dot-product attention
-        scores = torch.matmul(Q, K_for_scores.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(Q, K_for_scores.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_heads, q_len, head_dim) @ (B, n_heads, head_dim, kv_len) -> (B, n_heads, q_len, kv_len)
 
         if self.is_causal:
             kv_positions = torch.arange(kv_len, device=scores.device)
@@ -284,13 +302,14 @@ class GroupedQueryAttention(nn.Module):
             scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         if attention_mask is not None:
+            attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
             scores = scores + attention_mask
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
 
-        output = torch.matmul(attn, V_for_scores)
-        output = output.transpose(1, 2).contiguous().view(batch, q_len, -1)
+        output = torch.matmul(attn, V_for_scores)  # (B, n_heads, q_len, kv_len) @ (B, n_heads, kv_len, head_dim) -> (B, n_heads, q_len, head_dim)
+        output = output.transpose(1, 2).contiguous().view(batch, q_len, -1)  # (B, n_heads, q_len, head_dim) -> (B, q_len, n_heads * head_dim)
         output = self.o_proj(output)
 
         # Convert present tuple to KVCache if needed
@@ -310,9 +329,9 @@ class SwiGLU_FFN(nn.Module):
     Better than ReLU for language models.
     
     Architecture:
-        FFN(x) = (Swish(xW_gate) âŠ™ xW_up) W_down
+        FFN(x) = (Swish(xW_gate) * xW_up) W_down
     
-    Where âŠ™ is element-wise multiplication.
+    Where * is element-wise multiplication.
     
     Used in: PaLM, LLaMA, Mistral, etc.
     """
@@ -322,7 +341,7 @@ class SwiGLU_FFN(nn.Module):
         d_model: int,
         d_ff: int,
         dropout: float = 0.0,
-    ):
+    ) -> None:
         super().__init__()
         
         # Three projections for SwiGLU
@@ -341,12 +360,12 @@ class SwiGLU_FFN(nn.Module):
             output: (batch, seq_len, d_model)
         """
         # SwiGLU activation
-        gate = F.silu(self.gate_proj(x))  # Swish activation
-        up = self.up_proj(x)
-        hidden = gate * up  # Gated activation
+        gate: torch.Tensor = F.silu(self.gate_proj(x))  # Swish activation
+        up: torch.Tensor = self.up_proj(x)
+        hidden: torch.Tensor = gate * up  # Gated activation
         
         # Project back down
-        output = self.down_proj(hidden)
+        output: torch.Tensor = self.down_proj(hidden)
         output = self.dropout(output)
         
         return output

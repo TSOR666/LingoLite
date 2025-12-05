@@ -3,12 +3,15 @@ Multilingual Translation Tokenizer
 Specialized tokenizer for limited language pairs with efficient vocabulary
 """
 
-import torch
-from typing import List, Dict, Tuple, Optional
-from pathlib import Path
+from __future__ import annotations
+
 import json
-import sentencepiece as spm
 from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Optional, Union, cast
+
+import sentencepiece as spm  # type: ignore[import-untyped]
+import torch
 
 
 class TranslationTokenizer:
@@ -56,16 +59,17 @@ class TranslationTokenizer:
             self.tgt_token,
         ] + self.lang_tokens
         
-        self.sp_model = None
-        self.token_to_id = {}
-        self.id_to_token = {}
+        self.sp_model: Optional[spm.SentencePieceProcessor] = None
+        self.token_to_id: Dict[str, int] = {}
+        self.id_to_token: Dict[int, str] = {}
 
-    def _ensure_model_loaded(self):
+    def _ensure_model_loaded(self) -> None:
         """Ensure the SentencePiece model has been loaded before encoding/decoding."""
         if self.sp_model is None or not self.token_to_id:
             raise RuntimeError(
                 "Tokenizer model is not loaded. Call 'train' or 'load' before encoding/decoding."
             )
+        assert self.sp_model is not None
 
     def _validate_language(self, lang: str, role: str) -> None:
         """Validate that a requested language is supported."""
@@ -79,7 +83,7 @@ class TranslationTokenizer:
         corpus_files: List[str],
         character_coverage: float = 0.9995,
         model_type: str = "unigram"
-    ):
+    ) -> None:
         """
         Train tokenizer on multilingual corpus.
         
@@ -114,10 +118,10 @@ class TranslationTokenizer:
         
         print(f"âœ“ Tokenizer trained with vocab size: {len(self.token_to_id)}")
         
-    def load(self, model_path: str):
+    def load(self, model_path: Union[str, Path]) -> None:
         """Load trained tokenizer model."""
         self.sp_model = spm.SentencePieceProcessor()
-        self.sp_model.load(model_path)
+        self.sp_model.load(str(model_path))
         
         # Build token mappings
         self.token_to_id = {
@@ -128,7 +132,7 @@ class TranslationTokenizer:
         
         print(f"âœ“ Tokenizer loaded from {model_path}")
         
-    def save(self, save_dir: str):
+    def save(self, save_dir: Union[str, Path]) -> None:
         """Save tokenizer and config."""
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -153,7 +157,7 @@ class TranslationTokenizer:
         print(f"âœ“ Tokenizer saved to {save_dir} (config + SentencePiece files)")
         
     @classmethod
-    def from_pretrained(cls, load_dir: str):
+    def from_pretrained(cls, load_dir: Union[str, Path]) -> "TranslationTokenizer":
         """Load tokenizer from directory."""
         # SECURITY: Validate and resolve path
         load_dir = Path(load_dir).resolve()
@@ -204,9 +208,11 @@ class TranslationTokenizer:
             List of token IDs
         """
         self._ensure_model_loaded()
+        assert self.sp_model is not None
+        sp_model = cast(spm.SentencePieceProcessor, self.sp_model)
 
         # Encode text
-        token_ids = self.sp_model.encode_as_ids(text)
+        token_ids = cast(List[int], sp_model.encode_as_ids(text))
 
         if add_special_tokens:
             tokens = []
@@ -256,13 +262,15 @@ class TranslationTokenizer:
             Decoded text
         """
         self._ensure_model_loaded()
+        assert self.sp_model is not None
+        sp_model = cast(spm.SentencePieceProcessor, self.sp_model)
 
         if skip_special_tokens:
             # Remove special tokens
             special_ids = {self.token_to_id.get(tok, -1) for tok in self.special_tokens}
             token_ids = [tid for tid in token_ids if tid not in special_ids]
 
-        text = self.sp_model.decode_ids(token_ids)
+        text = cast(str, sp_model.decode_ids(token_ids))
         return text
     
     def batch_encode(
@@ -273,7 +281,7 @@ class TranslationTokenizer:
         padding: bool = True,
         max_length: Optional[int] = None,
         return_tensors: bool = True
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Union[torch.Tensor, List[List[int]]]]:
         """
         Batch encode texts with padding.
         
@@ -327,15 +335,17 @@ class TranslationTokenizer:
             encoded = padded
             
             if return_tensors:
-                return {
+                result: Dict[str, Union[torch.Tensor, List[List[int]]]] = {
                     'input_ids': torch.tensor(encoded, dtype=torch.long),
                     'attention_mask': torch.tensor(attention_masks, dtype=torch.long)
                 }
+                return result
             else:
-                return {
+                result = {
                     'input_ids': encoded,
                     'attention_mask': attention_masks
                 }
+                return result
         
         if return_tensors:
             return {'input_ids': torch.tensor(encoded, dtype=torch.long)}

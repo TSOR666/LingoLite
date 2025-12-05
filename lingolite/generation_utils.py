@@ -3,12 +3,28 @@ Generation Utilities for Mobile Translation Model
 Includes KV caching and beam search for efficient and high-quality generation
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
-from dataclasses import dataclass
 
 from .utils import logger
+
+if TYPE_CHECKING:
+    from .mobile_translation_model import MobileTranslationModel
+    from .encoder_decoder import LayerKVCache
+
+__all__ = [
+    "KVCache",
+    "LayerKVCache",
+    "BeamHypothesis",
+    "BeamSearchScorer",
+    "generate_with_kv_cache",
+    "generate_with_beam_search",
+]
 
 
 # ============================================================================
@@ -39,7 +55,7 @@ class KVCache:
         Returns:
             Updated KVCache instance
         """
-        if self.key is None:
+        if self.key is None or self.value is None:
             self.key = new_key
             self.value = new_value
         else:
@@ -73,9 +89,9 @@ class KVCache:
 class LayerKVCache:
     """Cache for a single layer containing self-attention and cross-attention KVs."""
 
-    def __init__(self):
-        self.self_attn_cache = KVCache()
-        self.cross_attn_cache = KVCache()  # Only computed once per generation
+    def __init__(self) -> None:
+        self.self_attn_cache: KVCache = KVCache()
+        self.cross_attn_cache: KVCache = KVCache()  # Only computed once per generation
 
     def to(self, device: torch.device) -> 'LayerKVCache':
         self.self_attn_cache.to(device)
@@ -122,7 +138,7 @@ class BeamHypothesis:
         tokens: torch.Tensor,
         score: float,
         attention_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> None:
         """
         Args:
             tokens: Token sequence (seq_len,)
@@ -133,7 +149,7 @@ class BeamHypothesis:
         self.score = score
         self.attention_mask = attention_mask
     
-    def __len__(self):
+    def __len__(self) -> int:
         return self.tokens.shape[0]
     
     def average_score(self, length_penalty: float = 1.0) -> float:
@@ -162,7 +178,7 @@ class BeamSearchScorer:
         length_penalty: float = 1.0,
         early_stopping: bool = True,
         eos_token_id: int = 2,
-    ):
+    ) -> None:
         """
         Args:
             batch_size: Number of sequences in batch
@@ -180,7 +196,7 @@ class BeamSearchScorer:
         self.eos_token_id = eos_token_id
 
         # Store finished hypotheses for each batch
-        self.finished_hypotheses = [[] for _ in range(batch_size)]
+        self.finished_hypotheses: List[List[BeamHypothesis]] = [[] for _ in range(batch_size)]
 
         # Track which sequences are done
         self.done = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -320,7 +336,7 @@ class BeamSearchScorer:
 # ============================================================================
 
 def generate_with_kv_cache(
-    model: 'MobileTranslationModel',
+    model: "MobileTranslationModel",
     src_input_ids: torch.Tensor,
     src_attention_mask: Optional[torch.Tensor] = None,
     max_length: int = 128,
@@ -441,7 +457,7 @@ def generate_with_kv_cache(
 # ============================================================================
 
 def generate_with_beam_search(
-    model: 'MobileTranslationModel',
+    model: "MobileTranslationModel",
     src_input_ids: torch.Tensor,
     src_attention_mask: Optional[torch.Tensor] = None,
     max_length: int = 128,
@@ -553,9 +569,9 @@ def generate_with_beam_search(
             next_tokens = next_tokens % vocab_size
             
             # Select best num_beams for each batch
-            beam_outputs = []
-            beam_next_tokens = []
-            beam_idx_list = []
+            beam_outputs: List[torch.Tensor] = []
+            beam_next_tokens: List[int] = []
+            beam_idx_list: List[int] = []
             
             for batch_idx in range(batch_size):
                 if beam_scorer.done[batch_idx]:
@@ -568,9 +584,9 @@ def generate_with_beam_search(
                     continue
                 
                 # Select num_beams
-                batch_next_scores = []
-                batch_next_tokens = []
-                batch_next_indices = []
+                batch_next_scores: List[float] = []
+                batch_next_tokens: List[torch.Tensor] = []
+                batch_next_indices: List[int] = []
                 
                 for beam_idx in range(num_beams):
                     if len(batch_next_scores) >= num_beams:
@@ -579,20 +595,20 @@ def generate_with_beam_search(
                     idx = beam_idx
                     next_token = next_tokens[batch_idx, idx]
                     next_score = next_scores[batch_idx, idx]
-                    beam_idx_in_batch = next_indices[batch_idx, idx]
+                    beam_idx_in_batch = int(next_indices[batch_idx, idx].item())
                     
-                    batch_next_scores.append(next_score)
+                    batch_next_scores.append(float(next_score.item()))
                     batch_next_tokens.append(next_token)
                     batch_next_indices.append(beam_idx_in_batch)
                 
                 # Update this batch's beams
                 for i in range(num_beams):
-                    beam_idx_global = batch_idx * num_beams + batch_next_indices[i].item()
+                    beam_idx_global = batch_idx * num_beams + batch_next_indices[i]
                     prev_input = input_ids[beam_idx_global]
 
                     beam_outputs.append(prev_input)
                     # Convert 0-D tensor to Python int to avoid indexing/concatenation errors
-                    beam_next_tokens.append(batch_next_tokens[i].item())
+                    beam_next_tokens.append(int(batch_next_tokens[i].item()))
                     beam_idx_list.append(beam_idx_global)
             
             # Create new input_ids
