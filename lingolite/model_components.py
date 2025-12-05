@@ -54,6 +54,10 @@ class RotaryPositionEmbedding(nn.Module):
     
     Used in: GPT-NeoX, LLaMA, PaLM, GPT-J, etc.
     """
+
+    inv_freq: torch.Tensor
+    cos_cached: torch.Tensor
+    sin_cached: torch.Tensor
     
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
         super().__init__()
@@ -64,6 +68,8 @@ class RotaryPositionEmbedding(nn.Module):
         # Compute frequency bands
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.register_buffer('cos_cached', torch.empty(0), persistent=False)
+        self.register_buffer('sin_cached', torch.empty(0), persistent=False)
         
         # Precompute cos and sin for efficiency
         self._precompute_freqs(max_seq_len)
@@ -72,6 +78,8 @@ class RotaryPositionEmbedding(nn.Module):
         """Precompute cos and sin for positions on the requested device."""
         if device is None:
             device = self.inv_freq.device
+        else:
+            device = torch.device(device)
 
         # Keep inv_freq on the same device as the cached tensors
         if self.inv_freq.device != device:
@@ -352,12 +360,12 @@ class SwiGLU_FFN(nn.Module):
             output: (batch, seq_len, d_model)
         """
         # SwiGLU activation
-        gate = F.silu(self.gate_proj(x))  # Swish activation
-        up = self.up_proj(x)
-        hidden = gate * up  # Gated activation
+        gate: torch.Tensor = F.silu(self.gate_proj(x))  # Swish activation
+        up: torch.Tensor = self.up_proj(x)
+        hidden: torch.Tensor = gate * up  # Gated activation
         
         # Project back down
-        output = self.down_proj(hidden)
+        output: torch.Tensor = self.down_proj(hidden)
         output = self.dropout(output)
         
         return output

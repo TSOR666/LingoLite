@@ -3,11 +3,12 @@ Utility Functions for Mobile Translation Model
 Input validation, logging, and helper functions
 """
 
-import torch
 import logging
 import sys
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Dict, List, Optional
+
+import torch
 
 
 # ============================================================================
@@ -79,7 +80,7 @@ class InputValidator:
         text: str,
         max_length: int = 10000,
         param_name: str = "text"
-    ):
+    ) -> None:
         """
         Validate input text.
         
@@ -112,9 +113,9 @@ class InputValidator:
         tensor: torch.Tensor,
         name: str,
         expected_dim: Optional[int] = None,
-        expected_shape: Optional[tuple] = None,
+        expected_shape: Optional[tuple[int, ...]] = None,
         check_finite: bool = True,
-    ):
+    ) -> None:
         """
         Validate tensor properties.
         
@@ -158,7 +159,7 @@ class InputValidator:
         token_ids: torch.Tensor,
         vocab_size: int,
         name: str = "token_ids"
-    ):
+    ) -> None:
         """
         Validate token IDs are in valid range.
         
@@ -192,9 +193,9 @@ class InputValidator:
     @staticmethod
     def validate_language_code(
         lang_code: str,
-        supported_languages: list,
+        supported_languages: List[str],
         param_name: str = "language"
-    ):
+    ) -> None:
         """
         Validate language code is supported.
         
@@ -225,7 +226,7 @@ class InputValidator:
         name: str,
         min_value: int = 1,
         max_value: Optional[int] = None,
-    ):
+    ) -> None:
         """
         Validate positive integer parameter.
         
@@ -256,7 +257,7 @@ class InputValidator:
         name: str,
         allow_zero: bool = True,
         allow_one: bool = True,
-    ):
+    ) -> None:
         """
         Validate probability value.
         
@@ -288,7 +289,7 @@ class InputValidator:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def count_parameters(model: torch.nn.Module) -> dict:
+def count_parameters(model: torch.nn.Module) -> Dict[str, int]:
     """
     Count model parameters.
     
@@ -308,7 +309,7 @@ def count_parameters(model: torch.nn.Module) -> dict:
     }
 
 
-def format_size(num_bytes: int) -> str:
+def format_size(num_bytes: float) -> str:
     """
     Format byte size in human-readable format.
     
@@ -368,7 +369,7 @@ def get_device(prefer_cuda: bool = True) -> torch.device:
     return device
 
 
-def set_seed(seed: int = 42):
+def set_seed(seed: int = 42) -> None:
     """
     Set random seeds for reproducibility.
     

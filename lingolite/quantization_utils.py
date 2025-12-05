@@ -3,15 +3,16 @@ Quantization Utilities for Mobile Deployment
 INT8 quantization and Quantization-Aware Training (QAT) support
 """
 
+import argparse
+import copy
+import json
+from pathlib import Path
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.quantization as quant
-from torch.quantization import QuantStub, DeQuantStub
-import argparse
-from pathlib import Path
-from typing import Optional, Dict
-import json
-import copy
+from torch.quantization import DeQuantStub, QuantStub  # type: ignore[attr-defined]
 
 from .mobile_translation_model import MobileTranslationModel
 from .utils import logger

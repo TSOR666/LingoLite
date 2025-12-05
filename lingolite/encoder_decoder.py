@@ -15,10 +15,6 @@ from .model_components import (
     SwiGLU_FFN
 )
 
-try:
-    from .generation_utils import LayerKVCache  # type: ignore
-except ImportError:  # pragma: no cover - generation utils optional during some installs
-    LayerKVCache = None
 if TYPE_CHECKING:
     from .generation_utils import LayerKVCache
 
@@ -190,7 +186,7 @@ class DecoderLayer(nn.Module):
         x = residual + x
 
         # Update self-attention cache
-        if use_cache and self_attn_cache is not None:
+        if use_cache and self_attn_cache is not None and layer_cache is not None:
             layer_cache.self_attn_cache = self_attn_cache
 
         # Cross-attention with pre-norm
@@ -216,7 +212,7 @@ class DecoderLayer(nn.Module):
         x = residual + x
 
         # Update cross-attention cache
-        if use_cache and cross_attn_cache is not None:
+        if use_cache and cross_attn_cache is not None and layer_cache is not None:
             layer_cache.cross_attn_cache = cross_attn_cache
 
         # Feed-forward with pre-norm
@@ -400,17 +396,16 @@ class TransformerDecoder(nn.Module):
             cross_attention_mask = (1.0 - cross_attention_mask) * -10000.0
         
         if use_cache:
-            if LayerKVCache is None:
-                raise RuntimeError("LayerKVCache is unavailable; ensure generation_utils is imported")
             if past_key_values is None:
-                past_key_values = [LayerKVCache() for _ in self.layers]
+                from .generation_utils import LayerKVCache as _LayerKVCache
+                past_key_values = [_LayerKVCache() for _ in self.layers]
             elif len(past_key_values) != len(self.layers):
                 raise ValueError(
                     f"Expected {len(self.layers)} past key values, got {len(past_key_values)}"
                 )
 
         # Initialize caches list if needed
-        updated_caches = [] if use_cache else None
+        updated_caches: Optional[List[Optional['LayerKVCache']]] = [] if use_cache else None
 
         # Apply decoder layers
         for i, layer in enumerate(self.layers):
@@ -425,7 +420,7 @@ class TransformerDecoder(nn.Module):
                 use_cache=use_cache,
             )
 
-            if use_cache:
+            if use_cache and updated_caches is not None:
                 updated_caches.append(new_cache)
 
         # Final normalization and projection
