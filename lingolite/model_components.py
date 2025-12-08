@@ -300,10 +300,14 @@ class GroupedQueryAttention(nn.Module):
             attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
             scores = scores + attention_mask
 
-        # Avoid NaNs when a row is fully masked by ensuring at least one finite score
-        fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
-        safe_scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
-        attn = F.softmax(safe_scores, dim=-1)
+        # Handle fully masked rows explicitly to avoid uniform attention on padding
+        fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
+        if fully_masked.any():
+            # Zero-out masked rows before softmax to keep output neutral
+            scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
+        attn = F.softmax(scores, dim=-1)
+        if fully_masked.any():
+            attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
         attn = self.dropout(attn)
 
         output = torch.matmul(attn, V_for_scores)  # (B, n_heads, q_len, kv_len) @ (B, n_heads, kv_len, head_dim) -> (B, n_heads, q_len, head_dim)

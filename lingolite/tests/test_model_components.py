@@ -9,8 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from lingolite.generation_utils import KVCache
-from lingolite.model_components import GroupedQueryAttention, RotaryPositionEmbedding
+from lingolite.generation_utils import KVCache  # noqa: E402
+from lingolite.model_components import GroupedQueryAttention, RotaryPositionEmbedding  # noqa: E402
 
 
 def test_rope_even_dim_guard() -> None:

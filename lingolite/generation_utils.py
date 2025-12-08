@@ -5,8 +5,9 @@ Includes KV caching and beam search for efficient and high-quality generation
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,7 +16,6 @@ from .utils import logger
 
 if TYPE_CHECKING:
     from .mobile_translation_model import MobileTranslationModel
-    from .encoder_decoder import LayerKVCache
 
 __all__ = [
     "KVCache",
@@ -174,12 +174,12 @@ class BeamHypothesis:
             score: Log probability score
             attention_mask: Attention mask (seq_len,)
         """
-        self.tokens = tokens
-        self.score = score
+        self.tokens: torch.Tensor = tokens
+        self.score: float = float(score)
         self.attention_mask = attention_mask
     
     def __len__(self) -> int:
-        return self.tokens.shape[0]
+        return int(self.tokens.shape[0])
     
     def average_score(self, length_penalty: float = 1.0) -> float:
         """
@@ -191,7 +191,12 @@ class BeamHypothesis:
         Returns:
             Normalized score: score / (length ** length_penalty)
         """
-        return self.score / (len(self) ** length_penalty)
+        length = float(len(self))
+        if length == 0.0:
+            # Avoid division by zero on malformed hypotheses
+            return float("-inf")
+        penalized_length: float = math.pow(length, float(length_penalty))
+        return float(self.score) / penalized_length
 
 
 class BeamSearchScorer:

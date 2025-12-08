@@ -5,7 +5,6 @@ Mobile-optimized transformer with GQA, RoPE, and SwiGLU
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, List, TYPE_CHECKING
 from .model_components import (
@@ -168,13 +167,6 @@ class DecoderLayer(nn.Module):
         # Masked self-attention with pre-norm
         residual = x
         x = self.norm1(x)
-        past_self = None
-        if layer_cache is not None and layer_cache.self_attn_cache.key is not None:
-            past_self = (
-                layer_cache.self_attn_cache.key,
-                layer_cache.self_attn_cache.value,
-            )
-
         x, self_attn_cache = self.self_attn(
             x,
             attention_mask=self_attention_mask,
@@ -192,13 +184,6 @@ class DecoderLayer(nn.Module):
         # Cross-attention with pre-norm
         residual = x
         x = self.norm2(x)
-        past_cross = None
-        if layer_cache is not None and layer_cache.cross_attn_cache.key is not None:
-            past_cross = (
-                layer_cache.cross_attn_cache.key,
-                layer_cache.cross_attn_cache.value,
-            )
-
         x, cross_attn_cache = self.cross_attn(
             query=x,
             key=encoder_output,
@@ -254,7 +239,7 @@ class TransformerEncoder(nn.Module):
         )
         
         # Encoder layers
-        self.layers = nn.ModuleList([
+        layers: List[EncoderLayer] = [
             EncoderLayer(
                 d_model=d_model,
                 n_heads=n_heads,
@@ -263,7 +248,9 @@ class TransformerEncoder(nn.Module):
                 dropout=dropout,
             )
             for _ in range(n_layers)
-        ])
+        ]
+        self.layers = nn.ModuleList(layers)
+        self._encoder_layers: List[EncoderLayer] = layers
         
         # Final normalization
         self.final_norm = RMSNorm(d_model)
@@ -284,7 +271,7 @@ class TransformerEncoder(nn.Module):
             encoder_output: (batch, seq_len, d_model)
         """
         # Embed tokens
-        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        x: torch.Tensor = self.embedding(input_ids) * math.sqrt(self.d_model)
         x = self.dropout(x)
         
         # Create attention mask for padding
@@ -295,7 +282,7 @@ class TransformerEncoder(nn.Module):
             attention_mask = (1.0 - attention_mask) * -10000.0
         
         # Apply encoder layers
-        for layer in self.layers:
+        for layer in self._encoder_layers:
             x = layer(x, attention_mask=attention_mask, rope=self.rope)
         
         # Final normalization
@@ -336,7 +323,7 @@ class TransformerDecoder(nn.Module):
         )
         
         # Decoder layers
-        self.layers = nn.ModuleList([
+        layers: List[DecoderLayer] = [
             DecoderLayer(
                 d_model=d_model,
                 n_heads=n_heads,
@@ -345,7 +332,9 @@ class TransformerDecoder(nn.Module):
                 dropout=dropout,
             )
             for _ in range(n_layers)
-        ])
+        ]
+        self.layers = nn.ModuleList(layers)
+        self._decoder_layers: List[DecoderLayer] = layers
         
         # Final normalization
         self.final_norm = RMSNorm(d_model)
@@ -398,17 +387,17 @@ class TransformerDecoder(nn.Module):
         if use_cache:
             if past_key_values is None:
                 from .generation_utils import LayerKVCache as _LayerKVCache
-                past_key_values = [_LayerKVCache() for _ in self.layers]
-            elif len(past_key_values) != len(self.layers):
+                past_key_values = [_LayerKVCache() for _ in self._decoder_layers]
+            elif len(past_key_values) != len(self._decoder_layers):
                 raise ValueError(
-                    f"Expected {len(self.layers)} past key values, got {len(past_key_values)}"
+                    f"Expected {len(self._decoder_layers)} past key values, got {len(past_key_values)}"
                 )
 
         # Initialize caches list if needed
-        updated_caches: Optional[List[Optional['LayerKVCache']]] = [] if use_cache else None
+        updated_caches: Optional[List['LayerKVCache']] = [] if use_cache else None
 
         # Apply decoder layers
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(self._decoder_layers):
             layer_cache = past_key_values[i] if past_key_values else None
             x, new_cache = layer(
                 x,
@@ -421,6 +410,8 @@ class TransformerDecoder(nn.Module):
             )
 
             if use_cache and updated_caches is not None:
+                if new_cache is None:
+                    raise ValueError("Decoder layer did not return cache while use_cache=True")
                 updated_caches.append(new_cache)
 
         # Final normalization and projection
