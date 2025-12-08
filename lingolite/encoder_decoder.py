@@ -276,6 +276,7 @@ class TransformerEncoder(nn.Module):
         
         # Create attention mask for padding
         if attention_mask is not None:
+            attention_mask = attention_mask.to(device=x.device, dtype=x.dtype)
             # Convert to (batch, 1, 1, seq_len) for broadcasting
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             # Convert 0/1 to -inf/0 for masking

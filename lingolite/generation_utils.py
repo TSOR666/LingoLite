@@ -534,9 +534,11 @@ def generate_with_beam_search(
             attention_mask=src_attention_mask,
         )
         
-        # Expand for beams: (batch * num_beams, src_len, d_model)
+        # Expand for beams
         encoder_output = encoder_output.unsqueeze(1).repeat(1, num_beams, 1, 1)
+        # (B, src_len, d_model) -> (B, 1, src_len, d_model) -> (B, num_beams, src_len, d_model)
         encoder_output = encoder_output.view(batch_size * num_beams, -1, encoder_output.shape[-1])
+        # (B, num_beams, src_len, d_model) -> (B*num_beams, src_len, d_model)
         
         if src_attention_mask is not None:
             src_attention_mask = src_attention_mask.unsqueeze(1).repeat(1, num_beams, 1)
@@ -600,6 +602,8 @@ def generate_with_beam_search(
             )
             
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode='floor')
+            # Convert flat indices to beam indices: next_tokens ∈ [0, num_beams*vocab_size) -> [0, num_beams)
+            assert next_indices.max().item() < num_beams, "Beam index out of bounds"
             next_tokens = next_tokens % vocab_size
             
             # Select best num_beams for each batch

@@ -144,6 +144,7 @@ class RotaryPositionEmbedding(nn.Module):
         sin = self.sin_cached[offset:offset + seq_len].unsqueeze(0).to(dtype=q.dtype, device=device)
         
         # Apply rotation
+        assert q.shape[-1] == k.shape[-1], f"Q/K head_dim mismatch: {q.shape[-1]} vs {k.shape[-1]}"
         q_rot = q * cos + self.rotate_half(q) * sin
         k_rot = k * cos + self.rotate_half(k) * sin
         
@@ -187,6 +188,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
+        assert self.head_dim > 1, f"head_dim must be > 1 for numerical stability, got {self.head_dim}"
         self.n_rep = n_heads // n_kv_heads  # Repetition factor
         self.is_causal = is_causal
         self.is_cross_attn = is_cross_attn
@@ -305,7 +307,10 @@ class GroupedQueryAttention(nn.Module):
         if fully_masked.any():
             # Zero-out masked rows before softmax to keep output neutral
             scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
-        attn = F.softmax(scores, dim=-1)
+        scores_for_softmax = scores.float() if (self.training and scores.dtype == torch.float16) else scores
+        attn = F.softmax(scores_for_softmax, dim=-1)
+        if attn.dtype != scores.dtype:
+            attn = attn.to(dtype=scores.dtype)
         if fully_masked.any():
             attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
         attn = self.dropout(attn)
