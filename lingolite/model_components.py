@@ -61,6 +61,8 @@ class RotaryPositionEmbedding(nn.Module):
     
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
         super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RotaryPositionEmbedding expects even dim, got {dim}")
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
@@ -146,16 +148,6 @@ class RotaryPositionEmbedding(nn.Module):
         k_rot = k * cos + self.rotate_half(k) * sin
         
         return q_rot, k_rot
-    
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        seq_len: Optional[int] = None,
-        offset: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Alias for forward to support both calling conventions."""
-        return self.forward(q, k, seq_len=seq_len, offset=offset)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -267,6 +259,9 @@ class GroupedQueryAttention(nn.Module):
                 Q, K = rope(Q, K, offset=past_len)
 
             if past_key is not None and past_value is not None:
+                # Align cached tensors with current device/dtype before concatenation
+                past_key = past_key.to(device=K.device, dtype=K.dtype)
+                past_value = past_value.to(device=V.device, dtype=V.dtype)
                 K = torch.cat([past_key, K], dim=2)
                 V = torch.cat([past_value, V], dim=2)
 
@@ -305,7 +300,10 @@ class GroupedQueryAttention(nn.Module):
             attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
             scores = scores + attention_mask
 
-        attn = F.softmax(scores, dim=-1)
+        # Avoid NaNs when a row is fully masked by ensuring at least one finite score
+        fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)
+        safe_scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
+        attn = F.softmax(safe_scores, dim=-1)
         attn = self.dropout(attn)
 
         output = torch.matmul(attn, V_for_scores)  # (B, n_heads, q_len, kv_len) @ (B, n_heads, kv_len, head_dim) -> (B, n_heads, q_len, head_dim)
@@ -316,7 +314,12 @@ class GroupedQueryAttention(nn.Module):
         updated_cache = None
         if use_cache and present is not None:
             from .generation_utils import KVCache
-            updated_cache = KVCache(key=present[0], value=present[1])
+            updated_cache = KVCache(
+                key=present[0],
+                value=present[1],
+                num_heads=self.n_kv_heads,
+                head_dim=self.head_dim,
+            )
 
         return output, updated_cache
 

@@ -36,10 +36,37 @@ class KVCache:
     """
     Key-Value cache for efficient autoregressive generation.
     Stores past key and value tensors to avoid recomputation.
+    Shapes are tracked to prevent mixing full heads and grouped KV heads.
     """
-    key: Optional[torch.Tensor] = None  # (batch, n_heads, seq_len, head_dim)
-    value: Optional[torch.Tensor] = None  # (batch, n_heads, seq_len, head_dim)
+    key: Optional[torch.Tensor] = None  # (batch, n_kv_heads, seq_len, head_dim)
+    value: Optional[torch.Tensor] = None  # (batch, n_kv_heads, seq_len, head_dim)
+    num_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     
+    def _validate_new(self, new_key: torch.Tensor, new_value: torch.Tensor) -> None:
+        if new_key.ndim != 4 or new_value.ndim != 4:
+            raise ValueError("KVCache expects 4D tensors shaped (batch, heads, seq_len, head_dim)")
+        if new_key.shape != new_value.shape:
+            raise ValueError("Key and value tensors must share the same shape")
+        batch, heads, _, head_dim = new_key.shape
+
+        if self.num_heads is None:
+            self.num_heads = heads
+        if self.head_dim is None:
+            self.head_dim = head_dim
+
+        if heads != self.num_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"KVCache head mismatch: expected heads={self.num_heads}, head_dim={self.head_dim}, "
+                f"got heads={heads}, head_dim={head_dim}"
+            )
+
+        if self.key is not None:
+            if self.key.shape[0] != batch:
+                raise ValueError("KVCache batch size mismatch during update")
+            if self.key.shape[1] != heads or self.key.shape[3] != head_dim:
+                raise ValueError("KVCache head dimensions changed during update")
+
     def update(
         self,
         new_key: torch.Tensor,
@@ -55,6 +82,8 @@ class KVCache:
         Returns:
             Updated KVCache instance
         """
+        self._validate_new(new_key, new_value)
+
         if self.key is None or self.value is None:
             self.key = new_key
             self.value = new_value
@@ -71,12 +100,12 @@ class KVCache:
             return None
         return self.key, self.value
 
-    def to(self, device: torch.device) -> 'KVCache':
-        """Move cache tensors to device."""
+    def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> 'KVCache':
+        """Move cache tensors to device/dtype."""
         if self.key is not None:
-            self.key = self.key.to(device)
+            self.key = self.key.to(device=device, dtype=dtype)
         if self.value is not None:
-            self.value = self.value.to(device)
+            self.value = self.value.to(device=device, dtype=dtype)
         return self
     
     def get_seq_len(self) -> int:
@@ -93,9 +122,9 @@ class LayerKVCache:
         self.self_attn_cache: KVCache = KVCache()
         self.cross_attn_cache: KVCache = KVCache()  # Only computed once per generation
 
-    def to(self, device: torch.device) -> 'LayerKVCache':
-        self.self_attn_cache.to(device)
-        self.cross_attn_cache.to(device)
+    def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> 'LayerKVCache':
+        self.self_attn_cache.to(device, dtype=dtype)
+        self.cross_attn_cache.to(device, dtype=dtype)
         return self
 
 
