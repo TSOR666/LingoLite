@@ -280,7 +280,7 @@ class TransformerEncoder(nn.Module):
             # Convert to (batch, 1, 1, seq_len) for broadcasting
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             # Convert 0/1 to -inf/0 for masking
-            attention_mask = (1.0 - attention_mask) * -10000.0
+            attention_mask = (1.0 - attention_mask) * torch.finfo(x.dtype).min
         
         # Apply encoder layers
         for layer in self._encoder_layers:
@@ -378,12 +378,12 @@ class TransformerDecoder(nn.Module):
         # Create self-attention mask (causal mask is handled in layer)
         if self_attention_mask is not None:
             self_attention_mask = self_attention_mask.unsqueeze(1).unsqueeze(2)
-            self_attention_mask = (1.0 - self_attention_mask) * -10000.0
+            self_attention_mask = (1.0 - self_attention_mask) * torch.finfo(x.dtype).min
 
         # Create cross-attention mask
         if cross_attention_mask is not None:
             cross_attention_mask = cross_attention_mask.unsqueeze(1).unsqueeze(2)
-            cross_attention_mask = (1.0 - cross_attention_mask) * -10000.0
+            cross_attention_mask = (1.0 - cross_attention_mask) * torch.finfo(x.dtype).min
         
         if use_cache:
             if past_key_values is None:

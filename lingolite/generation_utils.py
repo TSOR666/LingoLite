@@ -142,7 +142,7 @@ def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
         return logits
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits.float(), dim=-1), dim=-1)
 
     sorted_indices_to_remove = cumulative_probs > top_p
     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
@@ -505,6 +505,9 @@ def generate_with_beam_search(
     """
     Generate translation with beam search for higher quality.
     Expected improvement: +2-4 BLEU points over greedy decoding.
+
+    **Performance Note**: This recomputes the full decoder sequence at each
+    step (O(n²) per beam). Use ``generate_with_kv_cache`` for O(n) greedy.
     
     Args:
         model: Translation model
@@ -583,7 +586,7 @@ def generate_with_beam_search(
             next_token_logits = logits[:, -1, :]  # (batch * num_beams, vocab_size)
             
             # Convert to log probabilities
-            next_token_scores = F.log_softmax(next_token_logits, dim=-1)
+            next_token_scores = F.log_softmax(next_token_logits.float(), dim=-1)
             
             # Add beam scores
             next_token_scores = next_token_scores + beam_scores[:, None]

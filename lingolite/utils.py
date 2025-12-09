@@ -6,7 +6,7 @@ Input validation, logging, and helper functions
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -113,7 +113,7 @@ class InputValidator:
         tensor: torch.Tensor,
         name: str,
         expected_dim: Optional[int] = None,
-        expected_shape: Optional[tuple[int, ...]] = None,
+        expected_shape: Optional[Tuple[int, ...]] = None,
         check_finite: bool = True,
     ) -> None:
         """

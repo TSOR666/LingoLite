@@ -15,10 +15,6 @@ import pytest
 
 LEGACY_TEST_PATTERNS = [
     "test_cache_fix.py",
-    "test_beam_scorer_fixes.py",
-    "test_beam_search_critical_fixes.py",
-    "test_beam_search_fixes.py",
-    "test_beam_search_shape_and_init.py",
     "test_improvements.py",
 ]
 

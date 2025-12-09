@@ -307,7 +307,7 @@ class GroupedQueryAttention(nn.Module):
         if fully_masked.any():
             # Zero-out masked rows before softmax to keep output neutral
             scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
-        scores_for_softmax = scores.float() if (self.training and scores.dtype == torch.float16) else scores
+        scores_for_softmax = scores.float()  # (B, n_heads, q_len, kv_len)
         attn = F.softmax(scores_for_softmax, dim=-1)
         if attn.dtype != scores.dtype:
             attn = attn.to(dtype=scores.dtype)
