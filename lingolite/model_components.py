@@ -74,6 +74,9 @@ class RotaryPositionEmbedding(nn.Module):
         # Validate max_seq_len is positive
         if max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
         self.dim = dim
         self.max_seq_len = max_seq_len
