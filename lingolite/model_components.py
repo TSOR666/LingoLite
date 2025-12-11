@@ -19,9 +19,12 @@ class RMSNorm(nn.Module):
     Simpler and faster than LayerNorm, no bias/mean subtraction.
     Used in: LLaMA, Mistral, Gemma, etc.
     """
-    
+
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
+        # Validate eps is positive (required for numerical stability)
+        if eps <= 0:
+            raise ValueError(f"eps must be positive, got {eps}")
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         
@@ -61,6 +64,17 @@ class RotaryPositionEmbedding(nn.Module):
     
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
         super().__init__()
+<<<<<<< Updated upstream
+=======
+        if dim % 2 != 0:
+            raise ValueError(f"RotaryPositionEmbedding expects even dim, got {dim}")
+        # Validate base is positive (required for frequency computation)
+        if base <= 0:
+            raise ValueError(f"base must be positive, got {base}")
+        # Validate max_seq_len is positive
+        if max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+>>>>>>> Stashed changes
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base

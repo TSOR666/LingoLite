@@ -228,7 +228,7 @@ class TransformerEncoder(nn.Module):
     """
     Stack of Encoder Layers with embeddings.
     """
-    
+
     def __init__(
         self,
         vocab_size: int,
@@ -241,9 +241,11 @@ class TransformerEncoder(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         self.d_model = d_model
-        
+        # Cache scaling factor to avoid computing sqrt every forward pass
+        self.embedding_scale = math.sqrt(d_model)
+
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
         
@@ -283,8 +285,13 @@ class TransformerEncoder(nn.Module):
         Returns:
             encoder_output: (batch, seq_len, d_model)
         """
+<<<<<<< Updated upstream
         # Embed tokens
         x = self.embedding(input_ids) * math.sqrt(self.d_model)
+=======
+        # Embed tokens (use cached scaling factor)
+        x: torch.Tensor = self.embedding(input_ids) * self.embedding_scale
+>>>>>>> Stashed changes
         x = self.dropout(x)
         
         # Create attention mask for padding
@@ -308,7 +315,7 @@ class TransformerDecoder(nn.Module):
     """
     Stack of Decoder Layers with embeddings and output projection.
     """
-    
+
     def __init__(
         self,
         vocab_size: int,
@@ -322,10 +329,12 @@ class TransformerDecoder(nn.Module):
         tie_embeddings: bool = True,
     ):
         super().__init__()
-        
+
         self.d_model = d_model
         self.tie_embeddings = tie_embeddings
-        
+        # Cache scaling factor to avoid computing sqrt every forward pass
+        self.embedding_scale = math.sqrt(d_model)
+
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
         
@@ -381,8 +390,8 @@ class TransformerDecoder(nn.Module):
             logits: (batch, tgt_len, vocab_size)
             updated_caches: List of LayerKVCache if use_cache=True, else None
         """
-        # Embed tokens
-        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        # Embed tokens (use cached scaling factor)
+        x = self.embedding(input_ids) * self.embedding_scale
         x = self.dropout(x)
 
         # Create self-attention mask (causal mask is handled in layer)

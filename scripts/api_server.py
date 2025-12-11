@@ -130,7 +130,8 @@ async def startup_event() -> None:
         model_checkpoint = Path("./models/translation_model.pt")
         if model_checkpoint.exists():
             logger.info(f"Loading model from {model_checkpoint}...")
-            checkpoint = torch.load(model_checkpoint, map_location=device)
+            # SECURITY: Use weights_only=True to prevent arbitrary code execution
+            checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=True)
             vocab_size = tokenizer.get_vocab_size()
             model = create_model(vocab_size=vocab_size, model_size="small")
             state = checkpoint.get("model_state_dict", checkpoint)
@@ -285,7 +286,19 @@ async def general_exception_handler(request: Request, exc: Exception):
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("scripts.api_server:app", host="0.0.0.0", port=8000, log_level="info", reload=False)
+    # SECURITY: Default to localhost-only binding
+    # Set LINGOLITE_BIND_HOST=0.0.0.0 to expose externally (with proper firewall/VPN)
+    host = os.getenv("LINGOLITE_BIND_HOST", "127.0.0.1")
+    port = int(os.getenv("LINGOLITE_PORT", "8000"))
+
+    if host == "0.0.0.0":
+        logger.warning(
+            "SECURITY WARNING: Binding to 0.0.0.0 exposes API to all network interfaces. "
+            "Ensure proper firewall rules, authentication, and rate limiting are configured."
+        )
+
+    logger.info(f"Starting API server on {host}:{port}")
+    uvicorn.run("scripts.api_server:app", host=host, port=port, log_level="info", reload=False)
 
 
 if __name__ == "__main__":

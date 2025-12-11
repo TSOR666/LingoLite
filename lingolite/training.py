@@ -247,10 +247,12 @@ class TranslationTrainer:
         self.optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping
+        # Gradient clipping (L2 norm)
+        # Prevents exploding gradients by scaling gradient vector such that ||∇||₂ ≤ max_norm
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
-            self.gradient_clip
+            max_norm=self.gradient_clip,
+            norm_type=2.0,  # L2 norm (Euclidean)
         )
         
         # Optimizer step
@@ -331,7 +333,8 @@ class TranslationTrainer:
     def load_checkpoint(self, filename: str):
         """Load model checkpoint."""
         load_path = self.save_dir / filename
-        checkpoint = torch.load(load_path, map_location=self.device)
+        # SECURITY: Use weights_only=True to prevent arbitrary code execution
+        checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -474,6 +477,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--save-dir', type=str, default='./checkpoints',
                         help='Directory to save checkpoints')
 
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
+
     return parser
 
 
@@ -482,6 +489,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    # Set random seed for reproducibility
+    from .utils import set_seed
+    set_seed(args.seed)
+    logger.info(f"Random seed set to {args.seed} for reproducibility")
 
     # Validate required files exist
     train_data_path = Path(args.train_data)
