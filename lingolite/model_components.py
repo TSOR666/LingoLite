@@ -64,8 +64,6 @@ class RotaryPositionEmbedding(nn.Module):
     
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
         super().__init__()
-<<<<<<< Updated upstream
-=======
         if dim % 2 != 0:
             raise ValueError(f"RotaryPositionEmbedding expects even dim, got {dim}")
         # Validate base is positive (required for frequency computation)
@@ -74,13 +72,6 @@ class RotaryPositionEmbedding(nn.Module):
         # Validate max_seq_len is positive
         if max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
