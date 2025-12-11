@@ -79,11 +79,16 @@ class RotaryPositionEmbedding(nn.Module):
         # Compute frequency bands
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
-        self.register_buffer('cos_cached', torch.empty(0), persistent=False)
-        self.register_buffer('sin_cached', torch.empty(0), persistent=False)
-        
+        self._reset_cache()
+
         # Precompute cos and sin for efficiency
         self._precompute_freqs(max_seq_len)
+
+    def _reset_cache(self) -> None:
+        """Initialize empty cosine and sine caches on the correct device."""
+        empty = torch.empty(0, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        self.register_buffer('cos_cached', empty, persistent=False)
+        self.register_buffer('sin_cached', empty, persistent=False)
     
     def _precompute_freqs(self, seq_len: int, device: Optional[torch.device] = None) -> None:
         """Precompute cos and sin for positions on the requested device."""
@@ -92,9 +97,10 @@ class RotaryPositionEmbedding(nn.Module):
         else:
             device = torch.device(device)
 
-        # Keep inv_freq on the same device as the cached tensors
+        # Keep inv_freq on the same device as the cached tensors and clear stale caches
         if self.inv_freq.device != device:
             self.register_buffer('inv_freq', self.inv_freq.to(device), persistent=False)
+            self._reset_cache()
 
         positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         inv_freq = self.inv_freq

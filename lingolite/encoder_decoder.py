@@ -240,19 +240,19 @@ class TransformerEncoder(nn.Module):
             max_seq_len=max_seq_len
         )
         
-        # Encoder layers
-        layers: List[EncoderLayer] = [
-            EncoderLayer(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                d_ff=d_ff,
-                dropout=dropout,
-            )
-            for _ in range(n_layers)
-        ]
-        self.layers = nn.ModuleList(layers)
-        self._encoder_layers: List[EncoderLayer] = layers
+        # Encoder layers (tracked only via the ModuleList)
+        self.layers = nn.ModuleList(
+            [
+                EncoderLayer(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                )
+                for _ in range(n_layers)
+            ]
+        )
         
         # Final normalization
         self.final_norm = RMSNorm(d_model)
@@ -283,9 +283,9 @@ class TransformerEncoder(nn.Module):
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             # Convert 0/1 to -inf/0 for masking
             attention_mask = (1.0 - attention_mask) * torch.finfo(x.dtype).min
-        
+
         # Apply encoder layers
-        for layer in self._encoder_layers:
+        for layer in self.layers:
             x = layer(x, attention_mask=attention_mask, rope=self.rope)
         
         # Final normalization
