@@ -240,19 +240,19 @@ class TransformerEncoder(nn.Module):
             max_seq_len=max_seq_len
         )
         
-        # Encoder layers (tracked only via the ModuleList)
-        self.layers = nn.ModuleList(
-            [
-                EncoderLayer(
-                    d_model=d_model,
-                    n_heads=n_heads,
-                    n_kv_heads=n_kv_heads,
-                    d_ff=d_ff,
-                    dropout=dropout,
-                )
-                for _ in range(n_layers)
-            ]
-        )
+        # Encoder layers
+        layers: List[EncoderLayer] = [
+            EncoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                d_ff=d_ff,
+                dropout=dropout,
+            )
+            for _ in range(n_layers)
+        ]
+        # Track layers only via the ModuleList to avoid duplicate references
+        self.layers = nn.ModuleList(layers)
         
         # Final normalization
         self.final_norm = RMSNorm(d_model)
