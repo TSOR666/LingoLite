@@ -299,3 +299,5 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("ðŸ“š For more details, see README.md")
     print("=" * 80)
+#!/usr/bin/env python3
+# mypy: ignore-errors

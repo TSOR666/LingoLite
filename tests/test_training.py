@@ -46,6 +46,8 @@ class MockTokenizer:
                add_special_tokens: bool = True, max_length: int = 128) -> List[int]:
         # Simple mock encoding: just return token IDs based on text length
         content = list(range(10, 10 + min(len(text.split()), max_length - 6)))
+        # Add a deterministic signal from raw character length to differentiate texts of equal token count
+        content.append(min(len(text), max_length))
         if add_special_tokens:
             if src_lang and tgt_lang:
                 # Translation format

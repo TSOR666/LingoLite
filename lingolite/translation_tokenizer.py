@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Union, cast
+from typing import Dict, List, Optional, Union, cast, Tuple
 
 import sentencepiece as spm  # type: ignore[import-untyped]
 import torch
@@ -352,23 +352,54 @@ class TranslationTokenizer:
     
     def batch_decode(
         self,
-        token_ids_batch: List[List[int]],
+        token_ids_batch: Union[List[List[int]], torch.Tensor],
         skip_special_tokens: bool = True
     ) -> List[str]:
         """
         Batch decode token IDs to texts.
         
         Args:
-            token_ids_batch: List of token ID sequences
+            token_ids_batch: List of token ID sequences or tensor shaped (batch, seq_len)
             skip_special_tokens: Whether to remove special tokens
         
         Returns:
             List of decoded texts
         """
-        return [
-            self.decode(token_ids, skip_special_tokens)
-            for token_ids in token_ids_batch
-        ]
+        if isinstance(token_ids_batch, torch.Tensor):
+            token_ids_batch = token_ids_batch.tolist()
+        return [self.decode(token_ids, skip_special_tokens) for token_ids in token_ids_batch]
+    
+    # Compatibility aliases for callers expecting encode_batch/decode_batch
+    def encode_batch(
+        self,
+        texts: List[str],
+        src_lang: Optional[str] = None,
+        tgt_lang: Optional[str] = None,
+        max_length: Optional[int] = None,
+        return_tensors: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.batch_encode(
+            texts,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            padding=True,
+            max_length=max_length,
+            return_tensors=return_tensors,
+        )
+        input_ids = encoded['input_ids']
+        assert isinstance(input_ids, torch.Tensor)
+        attention_mask = encoded.get('attention_mask')
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        assert isinstance(attention_mask, torch.Tensor)
+        return input_ids, attention_mask
+
+    def decode_batch(
+        self,
+        token_ids_batch: Union[List[List[int]], torch.Tensor],
+        skip_special_tokens: bool = True
+    ) -> List[str]:
+        return self.batch_decode(token_ids_batch, skip_special_tokens=skip_special_tokens)
     
     @property
     def pad_token_id(self) -> int:

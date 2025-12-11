@@ -7,9 +7,9 @@ Evaluates trained LingoLite models on test datasets
 import torch
 import argparse
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple, cast
 import json
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 try:
     import sacrebleu
@@ -91,13 +91,13 @@ def translate_batch(
             batch = source_sentences[i:i + batch_size]
 
             # Tokenize
-            src_ids, src_mask = tokenizer.encode_batch(
+            encoded = tokenizer.batch_encode(
                 batch,
                 max_length=max_length,
                 return_tensors=True
             )
-            src_ids = src_ids.to(device)
-            src_mask = src_mask.to(device)
+            src_ids = cast(torch.Tensor, encoded['input_ids']).to(device)
+            src_mask = cast(torch.Tensor, encoded['attention_mask']).to(device)
 
             # Generate translations
             if use_cache:
@@ -247,18 +247,16 @@ def evaluate_model(
         Dictionary with evaluation metrics
     """
     # Setup device
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
-    logger.info(f"Using device: {device}")
+    device_obj = torch.device(device) if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device_obj}")
 
     # Load tokenizer
     logger.info(f"Loading tokenizer from {tokenizer_path}")
-    tokenizer = TranslationTokenizer.load(tokenizer_path)
+    tokenizer = TranslationTokenizer.from_pretrained(tokenizer_path)
 
     # Load model
     logger.info(f"Loading model from {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device_obj)
 
     # Extract config from checkpoint
     if 'config' in checkpoint:
@@ -267,14 +265,14 @@ def evaluate_model(
     else:
         # Assume default config
         model = MobileTranslationModel(
-            vocab_size=tokenizer.vocab_size,
+            vocab_size=tokenizer.get_vocab_size(),
             d_model=512,
             n_encoder_layers=6,
             n_decoder_layers=6,
         )
 
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
+    model.to(device_obj)
     model.eval()
 
     logger.info(f"Model loaded: {model.count_parameters()['total']:,} parameters")
@@ -290,19 +288,22 @@ def evaluate_model(
         model=model,
         tokenizer=tokenizer,
         source_sentences=source_sentences,
-        device=device,
+        device=device_obj,
         batch_size=batch_size,
         max_length=max_length,
         use_cache=use_cache,
     )
 
+    # Prepare references as list[list[str]] for sacrebleu
+    references: List[List[str]] = [[ref] for ref in reference_sentences]
+
     # Compute BLEU
     logger.info("Computing BLEU score...")
-    bleu_metrics = compute_bleu_metrics(translations, reference_sentences)
+    bleu_metrics = compute_bleu_metrics(translations, references)
 
     # Compute chrF
     logger.info("Computing chrF score...")
-    chrf_score = compute_chrf(translations, reference_sentences)
+    chrf_score = compute_chrf(translations, references)
 
     # Combine metrics
     metrics = {
@@ -335,7 +336,7 @@ def evaluate_model(
         logger.info(f"Results saved to {output_file}")
 
     # Save translations if requested
-    if save_translations:
+    if save_translations and output_file is not None:
         trans_file = output_file.parent / f"{output_file.stem}_translations.txt"
         with open(trans_file, 'w', encoding='utf-8') as f:
             for trans in translations:
@@ -345,7 +346,7 @@ def evaluate_model(
     return metrics
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate translation model with BLEU")
     parser.add_argument('--model', type=Path, required=True, help="Path to model checkpoint")
     parser.add_argument('--tokenizer', type=Path, required=True, help="Path to tokenizer directory")

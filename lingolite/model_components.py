@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Optional, Tuple, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from .generation_utils import KVCache
@@ -35,14 +35,15 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor (..., dim)
         """
-        # Compute RMS
-        x_float = x.float()  # compute mean in float32 for stability under mixed precision
+        # Compute RMS in float32 for stability, then return to input dtype
+        x_float = x.float()
         rms = torch.sqrt(torch.mean(x_float ** 2, dim=-1, keepdim=True) + self.eps)
         rms = rms.to(dtype=x.dtype)
         
-        # Normalize and scale
+        # Normalize and scale while preserving input dtype
+        weight = self.weight.to(dtype=x.dtype)
         x_normed = x / rms
-        return self.weight * x_normed
+        return weight * x_normed
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -308,8 +309,19 @@ class GroupedQueryAttention(nn.Module):
             scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         if attention_mask is not None:
+            # Support masks shaped (B, kv_len), (B, q_len, kv_len), or (B, 1, q_len, kv_len)
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask[:, None, None, :]
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask[:, None, :, :]
+            elif attention_mask.dim() != 4:
+                raise ValueError(
+                    f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
+                )
             attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
-            scores = scores + attention_mask
+            # Expect 1 for valid tokens, 0 for masked; convert to additive mask
+            padding_mask = attention_mask == 0
+            scores = scores.masked_fill(padding_mask, float('-inf'))
 
         # Handle fully masked rows explicitly to avoid uniform attention on padding
         fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
@@ -380,13 +392,21 @@ class SwiGLU_FFN(nn.Module):
         Returns:
             output: (batch, seq_len, d_model)
         """
-        # SwiGLU activation
-        gate: torch.Tensor = F.silu(self.gate_proj(x))  # Swish activation
-        up: torch.Tensor = self.up_proj(x)
+        def _linear(module: nn.Linear, inp: torch.Tensor) -> torch.Tensor:
+            weight = getattr(module, "weight", None)
+            bias = getattr(module, "bias", None)
+            # Quantized dynamic linear modules expose weight as a callable, so fall back to module(inp)
+            if isinstance(weight, torch.Tensor):
+                bias_cast = bias.to(dtype=inp.dtype) if isinstance(bias, torch.Tensor) else bias
+                return F.linear(inp, weight.to(dtype=inp.dtype), bias_cast)
+            return cast(torch.Tensor, module(inp))
+
+        gate: torch.Tensor = F.silu(_linear(self.gate_proj, x))  # Swish activation
+        up: torch.Tensor = _linear(self.up_proj, x)
         hidden: torch.Tensor = gate * up  # Gated activation
         
         # Project back down
-        output: torch.Tensor = self.down_proj(hidden)
+        output: torch.Tensor = _linear(self.down_proj, hidden)
         output = self.dropout(output)
         
         return output

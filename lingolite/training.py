@@ -84,9 +84,14 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
         tgt_lang_id = self.tokenizer.token_to_id[f"<{item['tgt_lang']}>"]
         tgt_ids = [tgt_lang_id] + tgt_ids + [self.tokenizer.eos_token_id]
         
+        src_mask = [1] * len(src_ids)
+        tgt_mask = [1] * len(tgt_ids)
+        
         return {
-            'src_ids': src_ids,
-            'tgt_ids': tgt_ids,
+            'src_input_ids': src_ids,
+            'tgt_input_ids': tgt_ids,
+            'src_attention_mask': src_mask,
+            'tgt_attention_mask': tgt_mask,
         }
 
 
@@ -111,8 +116,15 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
         }
     
     # Find max lengths
-    max_src_len = max(len(item['src_ids']) for item in batch)
-    max_tgt_len = max(len(item['tgt_ids']) for item in batch)
+    def _get(key: str, item: Dict[str, List[int]]) -> List[int]:
+        # Support both legacy keys ('src_ids') and new keys ('src_input_ids')
+        if key in item:
+            return item[key]
+        legacy_key = key.replace("_input", "")
+        return item[legacy_key]
+    
+    max_src_len = max(len(_get('src_input_ids', item)) for item in batch)
+    max_tgt_len = max(len(_get('tgt_input_ids', item)) for item in batch)
     
     # Pad sequences
     src_ids = []
@@ -122,13 +134,13 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
     
     for item in batch:
         # Pad source
-        src = item['src_ids']
+        src = _get('src_input_ids', item)
         src_padding = [pad_token_id] * (max_src_len - len(src))
         src_ids.append(src + src_padding)
         src_mask.append([1] * len(src) + [0] * len(src_padding))
         
         # Pad target
-        tgt = item['tgt_ids']
+        tgt = _get('tgt_input_ids', item)
         tgt_padding = [pad_token_id] * (max_tgt_len - len(tgt))
         tgt_ids.append(tgt + tgt_padding)
         tgt_mask.append([1] * len(tgt) + [0] * len(tgt_padding))
@@ -197,11 +209,12 @@ class TranslationTrainer:
         )
 
         # Learning rate scheduler (FIXED)
+        pct_start = min(max(float(warmup_steps) / float(max_steps), 0.0), 1.0)
         self.scheduler = OneCycleLR(
             self.optimizer,
             max_lr=learning_rate,
             total_steps=max_steps,
-            pct_start=warmup_steps / max_steps,
+            pct_start=pct_start,
             anneal_strategy='cos',
         )
 

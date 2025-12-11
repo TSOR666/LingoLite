@@ -103,7 +103,7 @@ class InputValidator:
         
         if len(text) > max_length:
             raise ValueError(
-                f"{param_name} too long: {len(text)} characters > {max_length} max"
+                f"{param_name} exceeds maximum length: {len(text)} characters > {max_length} max"
             )
         
         logger.debug(f"Validated text: {len(text)} characters")
@@ -135,7 +135,7 @@ class InputValidator:
         
         if expected_dim is not None and tensor.dim() != expected_dim:
             raise ValueError(
-                f"{name} expected {expected_dim}D tensor, got {tensor.dim()}D with shape {tensor.shape}"
+                f"{name} Expected {expected_dim} dimensions, got {tensor.dim()}D with shape {tensor.shape}"
             )
         
         if expected_shape is not None:
@@ -181,11 +181,11 @@ class InputValidator:
         max_id = token_ids.max().item()
         
         if min_id < 0:
-            raise ValueError(f"{name} contains negative values: min={min_id}")
+            raise ValueError(f"{name} out of range: min={min_id} < 0")
         
         if max_id >= vocab_size:
             raise ValueError(
-                f"{name} contains out-of-range values: max={max_id} >= vocab_size={vocab_size}"
+                f"{name} out of range: max={max_id} >= vocab_size={vocab_size}"
             )
         
         logger.debug(f"Validated {name}: range=[{min_id}, {max_id}], vocab_size={vocab_size}")
@@ -244,10 +244,10 @@ class InputValidator:
             raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
         
         if value < min_value:
-            raise ValueError(f"{name} must be >= {min_value}, got {value}")
+            raise ValueError(f"{name} must be at least {min_value}, got {value}")
         
         if max_value is not None and value > max_value:
-            raise ValueError(f"{name} must be <= {max_value}, got {value}")
+            raise ValueError(f"{name} must be at most {max_value}, got {value}")
         
         logger.debug(f"Validated {name}: {value}")
     
