@@ -287,8 +287,13 @@ class TransformerEncoder(nn.Module):
         """
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
         # Embed tokens
         x = self.embedding(input_ids) * math.sqrt(self.d_model)
+=======
+        # Embed tokens (use cached scaling factor)
+        x: torch.Tensor = self.embedding(input_ids) * self.embedding_scale
+>>>>>>> Stashed changes
 =======
         # Embed tokens (use cached scaling factor)
         x: torch.Tensor = self.embedding(input_ids) * self.embedding_scale
