@@ -97,9 +97,10 @@ class RotaryPositionEmbedding(nn.Module):
         else:
             device = torch.device(device)
 
-        # Keep inv_freq on the same device as the cached tensors
+        # Keep inv_freq on the same device as the cached tensors and clear stale caches
         if self.inv_freq.device != device:
             self.register_buffer('inv_freq', self.inv_freq.to(device), persistent=False)
+            self._reset_cache()
 
         positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         inv_freq = self.inv_freq
