@@ -3,24 +3,17 @@ Complete Mobile Translation Model
 Encoder-Decoder transformer optimized for mobile deployment
 """
 
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, TypedDict, Set, SupportsFloat, SupportsInt, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoder_decoder import TransformerDecoder, TransformerEncoder
-from .translation_tokenizer import TranslationTokenizer
 from .utils import InputValidator, logger
 
-# Import generation utilities
-try:
-    from .generation_utils import generate_with_kv_cache, generate_with_beam_search
-    GENERATION_UTILS_AVAILABLE = True
-except ImportError:
-    GENERATION_UTILS_AVAILABLE = False
-    logger.warning("generation_utils not available - advanced generation disabled")
+if TYPE_CHECKING:
+    from .generation_utils import LayerKVCache
 
 
 class MobileTranslationModel(nn.Module):
@@ -97,7 +90,7 @@ class MobileTranslationModel(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights with appropriate distributions."""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -112,10 +105,10 @@ class MobileTranslationModel(nn.Module):
         tgt_input_ids: torch.Tensor,
         src_attention_mask: Optional[torch.Tensor] = None,
         tgt_attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List] = None,
+        past_key_values: Optional[List["LayerKVCache"]] = None,
         use_cache: bool = False,
         encoder_output: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[List], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[List["LayerKVCache"]], torch.Tensor]:
         """
         Forward pass for training or inference.
 
@@ -467,7 +460,7 @@ class MobileTranslationModel(nn.Module):
 def create_model(
     vocab_size: int,
     model_size: str = 'small',
-    **kwargs
+    **kwargs: SupportsInt | SupportsFloat | bool,
 ) -> MobileTranslationModel:
     """
     Factory function to create models of different sizes.
@@ -480,48 +473,57 @@ def create_model(
     Returns:
         MobileTranslationModel instance
     """
-    # Predefined model configurations
-    MODEL_CONFIGS = {
-        'tiny': {
-            'd_model': 256,
-            'n_encoder_layers': 4,
-            'n_decoder_layers': 4,
-            'n_heads': 4,
-            'n_kv_heads': 2,
-            'd_ff': 1024,
-            'max_seq_len': 512,
-            'dropout': 0.1,
-        },
-        'small': {
-            'd_model': 512,
-            'n_encoder_layers': 6,
-            'n_decoder_layers': 6,
-            'n_heads': 8,
-            'n_kv_heads': 2,
-            'd_ff': 2048,
-            'max_seq_len': 512,
-            'dropout': 0.1,
-        },
-        'medium': {
-            'd_model': 768,
-            'n_encoder_layers': 8,
-            'n_decoder_layers': 8,
-            'n_heads': 12,
-            'n_kv_heads': 4,
-            'd_ff': 3072,
-            'max_seq_len': 512,
-            'dropout': 0.1,
-        },
-        'large': {
-            'd_model': 1024,
-            'n_encoder_layers': 12,
-            'n_decoder_layers': 12,
-            'n_heads': 16,
-            'n_kv_heads': 4,
-            'd_ff': 4096,
-            'max_seq_len': 512,
-            'dropout': 0.1,
-        },
+    class PresetConfig(TypedDict):
+        d_model: int
+        n_encoder_layers: int
+        n_decoder_layers: int
+        n_heads: int
+        n_kv_heads: int
+        d_ff: int
+        max_seq_len: int
+        dropout: float
+
+    MODEL_CONFIGS: Dict[str, PresetConfig] = {
+        'tiny': PresetConfig(
+            d_model=256,
+            n_encoder_layers=4,
+            n_decoder_layers=4,
+            n_heads=4,
+            n_kv_heads=2,
+            d_ff=1024,
+            max_seq_len=512,
+            dropout=0.1,
+        ),
+        'small': PresetConfig(
+            d_model=512,
+            n_encoder_layers=6,
+            n_decoder_layers=6,
+            n_heads=8,
+            n_kv_heads=2,
+            d_ff=2048,
+            max_seq_len=512,
+            dropout=0.1,
+        ),
+        'medium': PresetConfig(
+            d_model=768,
+            n_encoder_layers=8,
+            n_decoder_layers=8,
+            n_heads=12,
+            n_kv_heads=4,
+            d_ff=3072,
+            max_seq_len=512,
+            dropout=0.1,
+        ),
+        'large': PresetConfig(
+            d_model=1024,
+            n_encoder_layers=12,
+            n_decoder_layers=12,
+            n_heads=16,
+            n_kv_heads=4,
+            d_ff=4096,
+            max_seq_len=512,
+            dropout=0.1,
+        ),
     }
     
     if model_size not in MODEL_CONFIGS:
@@ -530,17 +532,48 @@ def create_model(
             f"Choose from: {list(MODEL_CONFIGS.keys())}"
         )
     
-    # Get base config and update with any overrides
-    config = MODEL_CONFIGS[model_size].copy()
-    config.update(kwargs)
-    
-    # Create model
-    model = MobileTranslationModel(
+    base = MODEL_CONFIGS[model_size]
+
+    allowed_override_keys: Set[str] = {
+        'd_model',
+        'n_encoder_layers',
+        'n_decoder_layers',
+        'n_heads',
+        'n_kv_heads',
+        'd_ff',
+        'max_seq_len',
+        'dropout',
+        'tie_embeddings',
+        'pad_token_id',
+    }
+    unexpected = [k for k in kwargs.keys() if k not in allowed_override_keys]
+    if unexpected:
+        raise ValueError(f"Unexpected overrides: {unexpected}")
+
+    d_model = int(cast(SupportsInt, kwargs.pop('d_model', base['d_model'])))
+    n_encoder_layers = int(cast(SupportsInt, kwargs.pop('n_encoder_layers', base['n_encoder_layers'])))
+    n_decoder_layers = int(cast(SupportsInt, kwargs.pop('n_decoder_layers', base['n_decoder_layers'])))
+    n_heads = int(cast(SupportsInt, kwargs.pop('n_heads', base['n_heads'])))
+    n_kv_heads = int(cast(SupportsInt, kwargs.pop('n_kv_heads', base['n_kv_heads'])))
+    d_ff = int(cast(SupportsInt, kwargs.pop('d_ff', base['d_ff'])))
+    max_seq_len = int(cast(SupportsInt, kwargs.pop('max_seq_len', base['max_seq_len'])))
+    dropout = float(cast(SupportsFloat, kwargs.pop('dropout', base['dropout'])))
+    tie_embeddings = bool(kwargs.pop('tie_embeddings', True))
+    pad_token_id = int(cast(SupportsInt, kwargs.pop('pad_token_id', 0)))
+
+    return MobileTranslationModel(
         vocab_size=vocab_size,
-        **config
+        d_model=d_model,
+        n_encoder_layers=n_encoder_layers,
+        n_decoder_layers=n_decoder_layers,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        dropout=dropout,
+        tie_embeddings=tie_embeddings,
+        pad_token_id=pad_token_id,
     )
-    
-    return model
 
 
 # Test the model

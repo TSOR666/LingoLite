@@ -42,8 +42,8 @@ export = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/LingoLite"
-Issues = "https://github.com/your-org/LingoLite/issues"
+Homepage = "https://github.com/TSOR666/LingoLite"
+Issues = "https://github.com/TSOR666/LingoLite/issues"
 
 [project.scripts]
 lingolite-train = "lingolite.training:main"

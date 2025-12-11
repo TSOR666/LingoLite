@@ -1,0 +1,36 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+.env
+.env.*
+*.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Editors / tooling
+.vscode/
+.idea/
+
+# ML artifacts and large assets
+tokenizer/
+models/
+checkpoints/
+data/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.log
+
+# Coverage / test outputs
+.coverage
+htmlcov/
+.pytest_cache/

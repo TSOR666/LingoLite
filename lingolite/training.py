@@ -3,22 +3,19 @@ Training Script for Mobile Translation Model
 Complete pipeline from data to trained model
 """
 
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, cast
+
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, Dataset
-import json
-import argparse
-import sys
-import logging
-from tqdm import tqdm
-import random
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 from .mobile_translation_model import MobileTranslationModel, create_model
 from .translation_tokenizer import TranslationTokenizer
@@ -28,14 +25,14 @@ from .utils import setup_logger
 logger = setup_logger(name="lingolite_training", level=logging.INFO)
 
 
-class TranslationDataset(Dataset):
+class TranslationDataset(Dataset[Dict[str, List[int]]]):
     """
     Dataset for translation pairs.
     """
     
     def __init__(
         self,
-        data: List[Dict],
+        data: List[Dict[str, str]],
         tokenizer: TranslationTokenizer,
         max_length: int = 128,
     ):
@@ -49,10 +46,10 @@ class TranslationDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         item = self.data[idx]
 
         # Validate required fields
@@ -93,7 +90,7 @@ class TranslationDataset(Dataset):
         }
 
 
-def collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
+def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     """
     Collate batch with padding.
     
@@ -152,8 +149,8 @@ class TranslationTrainer:
     def __init__(
         self,
         model: MobileTranslationModel,
-        train_loader: DataLoader,
-        val_loader: Optional[DataLoader] = None,
+        train_loader: DataLoader[Dict[str, torch.Tensor]],
+        val_loader: Optional[DataLoader[Dict[str, torch.Tensor]]] = None,
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
         warmup_steps: int = 2000,
@@ -235,7 +232,7 @@ class TranslationTrainer:
         batch = {k: v.to(self.device) for k, v in batch.items()}
         
         # Forward pass
-        loss = self.model.compute_loss(
+        loss: torch.Tensor = self.model.compute_loss(
             src_input_ids=batch['src_input_ids'],
             tgt_input_ids=batch['tgt_input_ids'],
             src_attention_mask=batch['src_attention_mask'],
@@ -245,7 +242,7 @@ class TranslationTrainer:
         
         # Backward pass
         self.optimizer.zero_grad()
-        loss.backward()
+        loss.backward()  # type: ignore[no-untyped-call]
         
         # Gradient clipping (L2 norm)
         # Prevents exploding gradients by scaling gradient vector such that ||∇||₂ ≤ max_norm
@@ -316,7 +313,7 @@ class TranslationTrainer:
             'perplexity': perplexity,
         }
     
-    def save_checkpoint(self, filename: str):
+    def save_checkpoint(self, filename: str) -> None:
         """Save model checkpoint."""
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -330,7 +327,7 @@ class TranslationTrainer:
         torch.save(checkpoint, save_path)
         print(f"✓ Checkpoint saved: {save_path}")
     
-    def load_checkpoint(self, filename: str):
+    def load_checkpoint(self, filename: str) -> None:
         """Load model checkpoint."""
         load_path = self.save_dir / filename
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
@@ -350,7 +347,7 @@ class TranslationTrainer:
         eval_steps: int = 5000,
         save_steps: int = 10000,
         log_steps: int = 100,
-    ):
+    ) -> None:
         """
         Main training loop.
 
@@ -365,7 +362,7 @@ class TranslationTrainer:
         print("=" * 80)
         print(f"Max steps: {self.max_steps}")
 
-        running_loss = 0
+        running_loss: float = 0.0
         training_complete = False
 
         for epoch in range(num_epochs):
@@ -542,21 +539,27 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"✓ Loaded {len(val_data)} validation examples")
 
         val_dataset = TranslationDataset(val_data, tokenizer, max_length=args.max_length)
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id)
+        val_loader = cast(
+            DataLoader[Dict[str, torch.Tensor]],
+            DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+            ),
         )
 
     # Create datasets
     print("\nCreating datasets...")
     train_dataset = TranslationDataset(train_data, tokenizer, max_length=args.max_length)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id)
+    train_loader = cast(
+        DataLoader[Dict[str, torch.Tensor]],
+        DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+        ),
     )
     print(f"✓ Train loader: {len(train_loader)} batches")
     if val_loader:

@@ -7,15 +7,19 @@ import argparse
 import copy
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
-import torch.quantization as quant
-from torch.quantization import DeQuantStub, QuantStub  # type: ignore[attr-defined]
+import torch.ao.quantization as quant
+from torch.ao.quantization import DeQuantStub, QuantStub
 
 from .mobile_translation_model import MobileTranslationModel
 from .utils import logger
+
+
+STATIC_QUANTIZATION_SUPPORTED = False
+QAT_SUPPORTED = False
 
 
 class QuantizableModel(nn.Module):
@@ -52,9 +56,9 @@ class QuantizableModel(nn.Module):
             use_cache=False,
         )
 
-        return logits
+        return cast(torch.Tensor, logits)
 
-    def generate(self, *args, **kwargs):
+    def generate(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Pass through to model's generate method."""
         return self.model.generate(*args, **kwargs)
 
@@ -73,6 +77,11 @@ def prepare_model_for_qat(
     Returns:
         Model prepared for QAT
     """
+    if not QAT_SUPPORTED:
+        raise RuntimeError(
+            "Quantization-aware training is not supported for this model layout. "
+            "Use dynamic quantization via apply_dynamic_quantization instead."
+        )
     logger.info(f"Preparing model for QAT with qconfig: {qconfig}")
 
     # Wrap model
@@ -83,16 +92,16 @@ def prepare_model_for_qat(
 
     # Configure quantization
     if qconfig == 'fbgemm':
-        qconfig_spec = torch.quantization.get_default_qat_qconfig('fbgemm')
+        qconfig_spec = quant.get_default_qat_qconfig('fbgemm')  # type: ignore[no-untyped-call]
     elif qconfig == 'qnnpack':
-        qconfig_spec = torch.quantization.get_default_qat_qconfig('qnnpack')
+        qconfig_spec = quant.get_default_qat_qconfig('qnnpack')  # type: ignore[no-untyped-call]
     else:
         raise ValueError(f"Unknown qconfig: {qconfig}")
 
     quantizable_model.qconfig = qconfig_spec
 
     # Prepare for QAT
-    torch.quantization.prepare_qat(quantizable_model, inplace=True)
+    quant.prepare_qat(quantizable_model, inplace=True)  # type: ignore[no-untyped-call]
 
     logger.info("Model prepared for QAT")
     return quantizable_model
@@ -110,16 +119,20 @@ def convert_qat_model(
     Returns:
         Quantized model for inference
     """
+    if not QAT_SUPPORTED:
+        raise RuntimeError(
+            "convert_qat_model called but QAT is not supported; run apply_dynamic_quantization instead."
+        )
     logger.info("Converting QAT model to quantized model...")
 
     # Set to eval mode
     qat_model.eval()
 
     # Convert to quantized model
-    quantized_model = torch.quantization.convert(qat_model, inplace=False)
+    quantized_model = quant.convert(qat_model, inplace=False)  # type: ignore[no-untyped-call]
 
     logger.info("QAT model converted to quantized model")
-    return quantized_model
+    return cast(QuantizableModel, quantized_model)
 
 
 def apply_dynamic_quantization(
@@ -148,19 +161,19 @@ def apply_dynamic_quantization(
     quantized_model.eval()
 
     # Apply dynamic quantization to Linear layers
-    quantized_model = torch.quantization.quantize_dynamic(
+    quantized_model = quant.quantize_dynamic(  # type: ignore[no-untyped-call]
         quantized_model,
         qconfig_spec={nn.Linear},  # Quantize all Linear layers
         dtype=dtype,
     )
 
     logger.info("Dynamic quantization applied")
-    return quantized_model
+    return cast(MobileTranslationModel, quantized_model)
 
 
 def apply_static_quantization(
     model: MobileTranslationModel,
-    calibration_data_loader,
+    calibration_data_loader: Iterable[Mapping[str, torch.Tensor]],
     qconfig: str = 'fbgemm',
 ) -> QuantizableModel:
     """
@@ -175,6 +188,11 @@ def apply_static_quantization(
     Returns:
         Statically quantized model
     """
+    if not STATIC_QUANTIZATION_SUPPORTED:
+        raise RuntimeError(
+            "Static quantization is not supported for this transformer model. "
+            "Use apply_dynamic_quantization for supported linear layers."
+        )
     logger.info(f"Applying static quantization with qconfig: {qconfig}")
 
     # Wrap model
@@ -184,10 +202,10 @@ def apply_static_quantization(
     # Set quantization config
     if qconfig == 'fbgemm':
         backend = 'fbgemm'
-        qconfig_spec = torch.quantization.get_default_qconfig('fbgemm')
+        qconfig_spec = quant.get_default_qconfig('fbgemm')  # type: ignore[no-untyped-call]
     elif qconfig == 'qnnpack':
         backend = 'qnnpack'
-        qconfig_spec = torch.quantization.get_default_qconfig('qnnpack')
+        qconfig_spec = quant.get_default_qconfig('qnnpack')  # type: ignore[no-untyped-call]
     else:
         raise ValueError(f"Unknown qconfig: {qconfig}")
 
@@ -195,7 +213,7 @@ def apply_static_quantization(
     quantizable_model.qconfig = qconfig_spec
 
     # Prepare for static quantization
-    torch.quantization.prepare(quantizable_model, inplace=True)
+    quant.prepare(quantizable_model, inplace=True)  # type: ignore[no-untyped-call]
 
     # Calibrate with representative data
     logger.info("Calibrating quantization parameters...")
@@ -215,10 +233,10 @@ def apply_static_quantization(
                 logger.info(f"Calibrated {i + 1} batches")
 
     # Convert to quantized model
-    quantized_model = torch.quantization.convert(quantizable_model, inplace=False)
+    quantized_model = quant.convert(quantizable_model, inplace=False)  # type: ignore[no-untyped-call]
 
     logger.info("Static quantization applied")
-    return quantized_model
+    return cast(QuantizableModel, quantized_model)
 
 
 def measure_model_size(model: nn.Module) -> Dict[str, float]:
@@ -238,7 +256,7 @@ def measure_model_size(model: nn.Module) -> Dict[str, float]:
     size_mb = buffer.tell() / (1024 ** 2)
 
     # Count parameters
-    num_params = sum(p.numel() for p in model.parameters())
+    num_params = float(sum(p.numel() for p in model.parameters()))
 
     return {
         'size_mb': size_mb,
@@ -249,7 +267,7 @@ def measure_model_size(model: nn.Module) -> Dict[str, float]:
 
 def benchmark_model(
     model: nn.Module,
-    input_shape: tuple = (1, 32),
+    input_shape: Tuple[int, int] = (1, 32),
     num_iterations: int = 100,
     warmup: int = 10,
 ) -> Dict[str, float]:
@@ -307,8 +325,8 @@ def benchmark_model(
 def compare_quantization_methods(
     model_path: Path,
     output_dir: Path,
-    calibration_data_loader = None,
-) -> Dict[str, Dict]:
+    calibration_data_loader: Optional[Iterable[Mapping[str, torch.Tensor]]] = None,
+) -> Dict[str, Dict[str, object]]:
     """
     Compare different quantization methods.
 
@@ -342,7 +360,7 @@ def compare_quantization_methods(
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    results = {}
+    results: Dict[str, Dict[str, object]] = {}
 
     # Baseline (FP32)
     logger.info("\n" + "=" * 80)
@@ -407,34 +425,11 @@ def compare_quantization_methods(
     except Exception as e:
         logger.warning(f"FP16 quantization failed: {e}")
 
-    # Static quantization (if calibration data provided)
+    # Static quantization intentionally disabled for this model
     if calibration_data_loader is not None:
-        logger.info("\n" + "=" * 80)
-        logger.info("Evaluating Static INT8 quantization...")
-        logger.info("=" * 80)
-        try:
-            static_int8_model = apply_static_quantization(
-                model, calibration_data_loader, qconfig='fbgemm'
-            )
-            static_int8_size = measure_model_size(static_int8_model)
-            static_int8_speed = benchmark_model(static_int8_model)
-            results['static_int8'] = {
-                'size': static_int8_size,
-                'speed': static_int8_speed,
-                'compression_ratio': baseline_size['size_mb'] / static_int8_size['size_mb'],
-                'speedup': baseline_speed['mean_ms'] / static_int8_speed['mean_ms'],
-            }
-            logger.info(f"Static INT8 - Size: {static_int8_size['size_mb']:.2f} MB "
-                        f"({results['static_int8']['compression_ratio']:.2f}x compression), "
-                        f"Speed: {static_int8_speed['mean_ms']:.2f} ms "
-                        f"({results['static_int8']['speedup']:.2f}x speedup)")
-
-            torch.save(
-                static_int8_model.state_dict(),
-                output_dir / 'model_static_int8.pt'
-            )
-        except Exception as e:
-            logger.warning(f"Static quantization failed: {e}")
+        logger.warning(
+            "Static quantization is not supported; skipping static INT8 evaluation."
+        )
 
     # Print summary
     print("\n" + "=" * 80)
@@ -444,8 +439,10 @@ def compare_quantization_methods(
     print("-" * 80)
 
     for method, data in results.items():
-        size = data['size']['size_mb']
-        speed = data['speed']['mean_ms']
+        size_info = cast(Dict[str, float], data['size'])
+        speed_info = cast(Dict[str, float], data['speed'])
+        size = size_info['size_mb']
+        speed = speed_info['mean_ms']
         compression = data.get('compression_ratio', 1.0)
         speedup = data.get('speedup', 1.0)
         print(f"{method:<20} {size:>10.2f}   {compression:>10.2f}x   {speed:>10.2f}   {speedup:>10.2f}x")
@@ -461,7 +458,7 @@ def compare_quantization_methods(
     return results
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Quantization utilities for translation model")
     parser.add_argument('--model', type=Path, required=True, help="Path to model checkpoint")
     parser.add_argument('--output-dir', type=Path, required=True, help="Directory to save quantized models")

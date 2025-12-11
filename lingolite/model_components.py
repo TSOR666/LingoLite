@@ -153,20 +153,11 @@ class RotaryPositionEmbedding(nn.Module):
         sin = self.sin_cached[offset:offset + seq_len].unsqueeze(0).to(dtype=q.dtype, device=device)
         
         # Apply rotation
+        assert q.shape[-1] == k.shape[-1], f"Q/K head_dim mismatch: {q.shape[-1]} vs {k.shape[-1]}"
         q_rot = q * cos + self.rotate_half(q) * sin
         k_rot = k * cos + self.rotate_half(k) * sin
         
         return q_rot, k_rot
-    
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        seq_len: Optional[int] = None,
-        offset: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Alias for forward to support both calling conventions."""
-        return self.forward(q, k, seq_len=seq_len, offset=offset)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -206,6 +197,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
+        assert self.head_dim > 1, f"head_dim must be > 1 for numerical stability, got {self.head_dim}"
         self.n_rep = n_heads // n_kv_heads  # Repetition factor
         self.is_causal = is_causal
         self.is_cross_attn = is_cross_attn
@@ -278,6 +270,9 @@ class GroupedQueryAttention(nn.Module):
                 Q, K = rope(Q, K, offset=past_len)
 
             if past_key is not None and past_value is not None:
+                # Align cached tensors with current device/dtype before concatenation
+                past_key = past_key.to(device=K.device, dtype=K.dtype)
+                past_value = past_value.to(device=V.device, dtype=V.dtype)
                 K = torch.cat([past_key, K], dim=2)
                 V = torch.cat([past_value, V], dim=2)
 
@@ -316,7 +311,17 @@ class GroupedQueryAttention(nn.Module):
             attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
             scores = scores + attention_mask
 
-        attn = F.softmax(scores, dim=-1)
+        # Handle fully masked rows explicitly to avoid uniform attention on padding
+        fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
+        if fully_masked.any():
+            # Zero-out masked rows before softmax to keep output neutral
+            scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
+        scores_for_softmax = scores.float()  # (B, n_heads, q_len, kv_len)
+        attn = F.softmax(scores_for_softmax, dim=-1)
+        if attn.dtype != scores.dtype:
+            attn = attn.to(dtype=scores.dtype)
+        if fully_masked.any():
+            attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
         attn = self.dropout(attn)
 
         output = torch.matmul(attn, V_for_scores)  # (B, n_heads, q_len, kv_len) @ (B, n_heads, kv_len, head_dim) -> (B, n_heads, q_len, head_dim)
@@ -327,7 +332,12 @@ class GroupedQueryAttention(nn.Module):
         updated_cache = None
         if use_cache and present is not None:
             from .generation_utils import KVCache
-            updated_cache = KVCache(key=present[0], value=present[1])
+            updated_cache = KVCache(
+                key=present[0],
+                value=present[1],
+                num_heads=self.n_kv_heads,
+                head_dim=self.head_dim,
+            )
 
         return output, updated_cache
 

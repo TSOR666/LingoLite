@@ -4,11 +4,11 @@ Thank you for your interest in contributing! This document explains how to get s
 
 ## Project Status
 
-LingoLite is an active research/development project and **not production ready**. The codebase is intentionally released for community training, experimentation, and hardening. Please review [PRODUCTION_READINESS.md](docs/reports/PRODUCTION_READINESS.md) to understand the current limitations before contributing.
+LingoLite is an active research/development project and **not production ready**. The codebase is intentionally released for community training, experimentation, and hardening. Please review [PRODUCTION_READINESS.md](../reports/PRODUCTION_READINESS.md) to understand the current limitations before contributing.
 
 ## Code of Conduct
 
-We follow the [Contributor Covenant](docs/policies/CODE_OF_CONDUCT.md). Please report unacceptable behaviour via GitHub issues or privately to the maintainers.
+We follow the [Contributor Covenant](CODE_OF_CONDUCT.md). Please report unacceptable behaviour via GitHub issues or privately to the maintainers.
 
 ## Development Setup
 

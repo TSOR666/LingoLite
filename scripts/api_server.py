@@ -7,6 +7,9 @@ Supports dev modes via environment variables:
 - LINGOLITE_USE_STUB_TOKENIZER=1: use a lightweight tokenizer stub
 - LINGOLITE_ALLOW_RANDOM_MODEL=1: create a random tiny model if no checkpoint
 - LINGOLITE_ECHO_MODE=1: return the input text as the translation
+- LINGOLITE_MODEL_SIZE / MODEL_SIZE: override model preset (tiny/small/medium/large)
+- LINGOLITE_DEVICE / DEVICE: choose cuda/cpu/auto device preference
+- LINGOLITE_ALLOWED_ORIGINS: comma-separated list of allowed CORS origins ("*" to disable protection)
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -27,6 +30,49 @@ from lingolite.utils import setup_logger, get_device
 
 logger = setup_logger(name="lingolite_api", level=logging.INFO)
 
+DEFAULT_ALLOWED_ORIGINS = ["http://localhost", "http://127.0.0.1"]
+MODEL_SIZE_CHOICES = {"tiny", "small", "medium", "large"}
+DEVICE_PREFERENCES = {"auto", "cpu", "cuda"}
+
+
+def _parse_allowed_origins() -> List[str]:
+    env_value = os.getenv("LINGOLITE_ALLOWED_ORIGINS")
+    if not env_value:
+        return DEFAULT_ALLOWED_ORIGINS
+
+    parsed = [origin.strip() for origin in env_value.split(",") if origin.strip()]
+    if not parsed:
+        logger.warning("LINGOLITE_ALLOWED_ORIGINS was provided but empty; reverting to defaults.")
+        return DEFAULT_ALLOWED_ORIGINS
+
+    if parsed == ["*"]:
+        logger.warning("CORS is unrestricted (LINGOLITE_ALLOWED_ORIGINS='*'). Only use this in trusted networks.")
+    return parsed
+
+
+def _resolve_model_size() -> str:
+    env_value = (os.getenv("LINGOLITE_MODEL_SIZE") or os.getenv("MODEL_SIZE") or "small").lower()
+    if env_value not in MODEL_SIZE_CHOICES:
+        logger.warning("Unsupported model size '%s'. Falling back to 'small'.", env_value)
+        return "small"
+    return env_value
+
+
+def _resolve_device_preference() -> str:
+    env_value = (os.getenv("LINGOLITE_DEVICE") or os.getenv("DEVICE") or "auto").lower()
+    if env_value not in DEVICE_PREFERENCES:
+        logger.warning("Unsupported device preference '%s'. Falling back to 'auto'.", env_value)
+        return "auto"
+    return env_value
+
+
+def _select_device(preference: str) -> torch.device:
+    prefer_cuda = preference != "cpu"
+    resolved = get_device(prefer_cuda=prefer_cuda)
+    if preference == "cuda" and resolved.type != "cuda":
+        logger.warning("CUDA requested but unavailable. Using %s instead.", resolved)
+    return resolved
+
 app = FastAPI(
     title="LingoLite Translation API",
     description="Mobile-optimized neural machine translation service",
@@ -35,10 +81,8 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS configuration - can be restricted via environment variable
-# For production, set LINGOLITE_ALLOWED_ORIGINS="https://yourdomain.com,https://anotherdomain.com"
-allowed_origins_env = os.getenv("LINGOLITE_ALLOWED_ORIGINS", "*")
-allowed_origins = allowed_origins_env.split(",") if allowed_origins_env != "*" else ["*"]
+# CORS configuration - defaults to localhost-only for safety
+allowed_origins = _parse_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +95,9 @@ app.add_middleware(
 model: Optional[MobileTranslationModel] = None
 tokenizer: Optional[TranslationTokenizer] = None
 device: torch.device = torch.device("cpu")
+device_preference: str = "auto"
+configured_model_size: str = "small"
+current_model_size: Optional[str] = None
 
 
 class TranslationRequest(BaseModel):
@@ -95,7 +142,7 @@ class ErrorResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    global model, tokenizer, device
+    global model, tokenizer, device, device_preference, configured_model_size, current_model_size
     logger.info("Starting LingoLite API server...")
 
     # Lightweight mode for tests/dev
@@ -104,11 +151,14 @@ async def startup_event() -> None:
         model = None
         tokenizer = None
         device = torch.device("cpu")
+        configured_model_size = _resolve_model_size()
+        current_model_size = None
         return
 
     try:
         # Device
-        device = get_device(prefer_cuda=True)
+        device_preference = _resolve_device_preference()
+        device = _select_device(device_preference)
         logger.info(f"Using device: {device}")
 
         # Tokenizer
@@ -127,29 +177,36 @@ async def startup_event() -> None:
         logger.info(f"Tokenizer ready: vocab_size={tokenizer.get_vocab_size()}")
 
         # Model
+        configured_model_size = _resolve_model_size()
         model_checkpoint = Path("./models/translation_model.pt")
         if model_checkpoint.exists():
             logger.info(f"Loading model from {model_checkpoint}...")
             # SECURITY: Use weights_only=True to prevent arbitrary code execution
             checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=True)
             vocab_size = tokenizer.get_vocab_size()
-            model = create_model(vocab_size=vocab_size, model_size="small")
+            model = create_model(vocab_size=vocab_size, model_size=configured_model_size)
             state = checkpoint.get("model_state_dict", checkpoint)
             model.load_state_dict(state)
             model = model.to(device)
             model.eval()
             logger.info("Model loaded from checkpoint")
+            current_model_size = configured_model_size
         else:
             if os.getenv("LINGOLITE_ALLOW_RANDOM_MODEL") == "1":
                 logger.warning("Using randomly initialized model (dev mode)")
                 vocab_size = tokenizer.get_vocab_size()
-                model = create_model(vocab_size=vocab_size, model_size="tiny").to(device)
+                model = create_model(vocab_size=vocab_size, model_size=configured_model_size).to(device)
                 model.eval()
+                current_model_size = configured_model_size
             else:
                 raise RuntimeError("Model checkpoint not found at ./models/translation_model.pt")
 
         params = model.count_parameters()
-        logger.info(f"Model ready: {params['total']/1e6:.1f}M parameters")
+        logger.info(
+            "Model ready: size=%s total_params=%.1fM",
+            current_model_size,
+            params["total"] / 1e6,
+        )
         logger.info("LingoLite API server started successfully")
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
@@ -178,7 +235,7 @@ async def health_check() -> HealthResponse:
         model_loaded=model is not None,
         tokenizer_loaded=tokenizer is not None,
         device=str(device),
-        model_size="tiny" if model is not None else None,
+        model_size=current_model_size,
     )
 
 

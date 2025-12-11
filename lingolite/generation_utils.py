@@ -5,8 +5,9 @@ Includes KV caching and beam search for efficient and high-quality generation
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,7 +16,6 @@ from .utils import logger
 
 if TYPE_CHECKING:
     from .mobile_translation_model import MobileTranslationModel
-    from .encoder_decoder import LayerKVCache
 
 __all__ = [
     "KVCache",
@@ -36,10 +36,37 @@ class KVCache:
     """
     Key-Value cache for efficient autoregressive generation.
     Stores past key and value tensors to avoid recomputation.
+    Shapes are tracked to prevent mixing full heads and grouped KV heads.
     """
-    key: Optional[torch.Tensor] = None  # (batch, n_heads, seq_len, head_dim)
-    value: Optional[torch.Tensor] = None  # (batch, n_heads, seq_len, head_dim)
+    key: Optional[torch.Tensor] = None  # (batch, n_kv_heads, seq_len, head_dim)
+    value: Optional[torch.Tensor] = None  # (batch, n_kv_heads, seq_len, head_dim)
+    num_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     
+    def _validate_new(self, new_key: torch.Tensor, new_value: torch.Tensor) -> None:
+        if new_key.ndim != 4 or new_value.ndim != 4:
+            raise ValueError("KVCache expects 4D tensors shaped (batch, heads, seq_len, head_dim)")
+        if new_key.shape != new_value.shape:
+            raise ValueError("Key and value tensors must share the same shape")
+        batch, heads, _, head_dim = new_key.shape
+
+        if self.num_heads is None:
+            self.num_heads = heads
+        if self.head_dim is None:
+            self.head_dim = head_dim
+
+        if heads != self.num_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"KVCache head mismatch: expected heads={self.num_heads}, head_dim={self.head_dim}, "
+                f"got heads={heads}, head_dim={head_dim}"
+            )
+
+        if self.key is not None:
+            if self.key.shape[0] != batch:
+                raise ValueError("KVCache batch size mismatch during update")
+            if self.key.shape[1] != heads or self.key.shape[3] != head_dim:
+                raise ValueError("KVCache head dimensions changed during update")
+
     def update(
         self,
         new_key: torch.Tensor,
@@ -55,6 +82,8 @@ class KVCache:
         Returns:
             Updated KVCache instance
         """
+        self._validate_new(new_key, new_value)
+
         if self.key is None or self.value is None:
             self.key = new_key
             self.value = new_value
@@ -71,12 +100,12 @@ class KVCache:
             return None
         return self.key, self.value
 
-    def to(self, device: torch.device) -> 'KVCache':
-        """Move cache tensors to device."""
+    def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> 'KVCache':
+        """Move cache tensors to device/dtype."""
         if self.key is not None:
-            self.key = self.key.to(device)
+            self.key = self.key.to(device=device, dtype=dtype)
         if self.value is not None:
-            self.value = self.value.to(device)
+            self.value = self.value.to(device=device, dtype=dtype)
         return self
     
     def get_seq_len(self) -> int:
@@ -93,9 +122,9 @@ class LayerKVCache:
         self.self_attn_cache: KVCache = KVCache()
         self.cross_attn_cache: KVCache = KVCache()  # Only computed once per generation
 
-    def to(self, device: torch.device) -> 'LayerKVCache':
-        self.self_attn_cache.to(device)
-        self.cross_attn_cache.to(device)
+    def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> 'LayerKVCache':
+        self.self_attn_cache.to(device, dtype=dtype)
+        self.cross_attn_cache.to(device, dtype=dtype)
         return self
 
 
@@ -113,7 +142,7 @@ def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
         return logits
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits.float(), dim=-1), dim=-1)
 
     sorted_indices_to_remove = cumulative_probs > top_p
     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
@@ -145,12 +174,12 @@ class BeamHypothesis:
             score: Log probability score
             attention_mask: Attention mask (seq_len,)
         """
-        self.tokens = tokens
-        self.score = score
+        self.tokens: torch.Tensor = tokens
+        self.score: float = float(score)
         self.attention_mask = attention_mask
     
     def __len__(self) -> int:
-        return self.tokens.shape[0]
+        return int(self.tokens.shape[0])
     
     def average_score(self, length_penalty: float = 1.0) -> float:
         """
@@ -162,7 +191,12 @@ class BeamHypothesis:
         Returns:
             Normalized score: score / (length ** length_penalty)
         """
-        return self.score / (len(self) ** length_penalty)
+        length = float(len(self))
+        if length == 0.0:
+            # Avoid division by zero on malformed hypotheses
+            return float("-inf")
+        penalized_length: float = math.pow(length, float(length_penalty))
+        return float(self.score) / penalized_length
 
 
 class BeamSearchScorer:
@@ -471,6 +505,9 @@ def generate_with_beam_search(
     """
     Generate translation with beam search for higher quality.
     Expected improvement: +2-4 BLEU points over greedy decoding.
+
+    **Performance Note**: This recomputes the full decoder sequence at each
+    step (O(n²) per beam). Use ``generate_with_kv_cache`` for O(n) greedy.
     
     Args:
         model: Translation model
@@ -500,9 +537,11 @@ def generate_with_beam_search(
             attention_mask=src_attention_mask,
         )
         
-        # Expand for beams: (batch * num_beams, src_len, d_model)
+        # Expand for beams
         encoder_output = encoder_output.unsqueeze(1).repeat(1, num_beams, 1, 1)
+        # (B, src_len, d_model) -> (B, 1, src_len, d_model) -> (B, num_beams, src_len, d_model)
         encoder_output = encoder_output.view(batch_size * num_beams, -1, encoder_output.shape[-1])
+        # (B, num_beams, src_len, d_model) -> (B*num_beams, src_len, d_model)
         
         if src_attention_mask is not None:
             src_attention_mask = src_attention_mask.unsqueeze(1).repeat(1, num_beams, 1)
@@ -547,7 +586,7 @@ def generate_with_beam_search(
             next_token_logits = logits[:, -1, :]  # (batch * num_beams, vocab_size)
             
             # Convert to log probabilities
-            next_token_scores = F.log_softmax(next_token_logits, dim=-1)
+            next_token_scores = F.log_softmax(next_token_logits.float(), dim=-1)
             
             # Add beam scores
             next_token_scores = next_token_scores + beam_scores[:, None]
@@ -566,6 +605,8 @@ def generate_with_beam_search(
             )
             
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode='floor')
+            # Convert flat indices to beam indices: next_tokens ∈ [0, num_beams*vocab_size) -> [0, num_beams)
+            assert next_indices.max().item() < num_beams, "Beam index out of bounds"
             next_tokens = next_tokens % vocab_size
             
             # Select best num_beams for each batch

@@ -8,18 +8,18 @@
 
 ---
 
-## ⚠️ Development Status
+## Development Status
 
-**LingoLite is currently in active development and is NOT production-ready.**
+**LingoLite is ready for community experimentation but remains non-production.**
 
-- ❌ **No pre-trained models included** - You must train models from scratch
-- ❌ **Training pipeline experimental** - Tested only with dummy data, not validated on real datasets
-- ❌ **No example training data** - Users must source and prepare their own datasets
-- ⚠️ **API server requires trained artifacts** - Will not start without model checkpoint and tokenizer
-- 🤝 **Community-maintained** - Provided as-is for contributors to train, evaluate, and harden
-- ℹ️ **Suitable for research and experimentation** - Good foundation for building custom translation systems
+- `NO CHECKPOINTS`: ship your own tokenizer and model artifacts
+- `PIPELINE IN FLUX`: training loop validated only on tiny synthetic data
+- `BRING DATA`: repository does not include real datasets
+- `API NEEDS ARTIFACTS`: server fails closed unless checkpoints/tokenizers are mounted
+- `COMMUNITY DRIVEN`: success depends on contributors sharing improvements
+- `RESEARCH FOCUS`: refer to `docs/reports/PRODUCTION_READINESS.md` for detailed limitations
 
-**For detailed production readiness assessment, see [PRODUCTION_READINESS.md](docs/reports/PRODUCTION_READINESS.md)**
+See [`docs/reports/OPEN_SOURCE_READINESS_REPORT.md`](docs/reports/OPEN_SOURCE_READINESS_REPORT.md) for the latest open-source verification summary.
 
 ---
 
@@ -286,6 +286,9 @@ LingoLite includes a production-ready FastAPI server for serving translations vi
 pip install -e .[api]                 # install server dependencies
 export LINGOLITE_USE_STUB_TOKENIZER=1 # optional: use stub tokenizer (no artifacts)
 export LINGOLITE_ALLOW_RANDOM_MODEL=1 # optional: create random tiny model
+export LINGOLITE_MODEL_SIZE=small     # optional: choose tiny/small/medium/large
+export LINGOLITE_DEVICE=auto          # optional: auto|cpu|cuda
+export LINGOLITE_ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
 lingolite-api
 ```
 
@@ -295,8 +298,13 @@ Windows PowerShell:
 pip install -e .[api]
 $env:LINGOLITE_USE_STUB_TOKENIZER = "1"
 $env:LINGOLITE_ALLOW_RANDOM_MODEL = "1"
+$env:LINGOLITE_MODEL_SIZE = "small"
+$env:LINGOLITE_DEVICE = "auto"
+$env:LINGOLITE_ALLOWED_ORIGINS = "http://localhost,http://127.0.0.1"
 lingolite-api
 ```
+
+`LINGOLITE_MODEL_SIZE`, `LINGOLITE_DEVICE`, and `LINGOLITE_ALLOWED_ORIGINS` are applied on startup so you can pin the preset, choose CPU/GPU, and lock CORS domains without modifying the server code.
 
 ### API Endpoints
 
@@ -529,7 +537,7 @@ The evaluation suite provides:
 - **Memory profiling**: Peak memory usage during inference
 - **Error analysis**: Common failure patterns and edge cases
 
-See [EVALUATION_REPORT.md](docs/reports/EVALUATION_REPORT.md) for comprehensive benchmark results.
+See [COMMUNITY_DEPLOYMENT_REVIEW.md](docs/reports/COMMUNITY_DEPLOYMENT_REVIEW.md) for the latest community deployment checklist and verification notes.
 
 ## Training
 
@@ -746,7 +754,7 @@ LingoLite implements comprehensive security measures:
 - **Token ID Validation**: Prevents out-of-bounds access
 - **No Code Execution**: Pure data processing, no eval() or exec()
 
-See `AUDIT_REPORT.md` for detailed security audit results.
+See [SECURITY.md](docs/policies/SECURITY.md) for detailed security policies and audit guidance.
 
 ## Performance
 
@@ -873,13 +881,13 @@ Comprehensive documentation is available:
 
 - **[README.md](README.md)** - Quick start guide and API reference (this file)
 - **[PRODUCTION_READINESS.md](docs/reports/PRODUCTION_READINESS.md)** - **START HERE: Honest assessment of current state**
+- **[OPEN_SOURCE_READINESS_REPORT.md](docs/reports/OPEN_SOURCE_READINESS_REPORT.md)** - Open source release checklist and legal verification
+- **[COMMUNITY_DEPLOYMENT_REVIEW.md](docs/reports/COMMUNITY_DEPLOYMENT_REVIEW.md)** - Deployment & training readiness review for contributors
 - **[SECURITY.md](docs/policies/SECURITY.md)** - Security policy and vulnerability reporting
 - **[CHANGELOG.md](docs/reference/CHANGELOG.md)** - Version history and release notes
 - **[CONTRIBUTING.md](docs/policies/CONTRIBUTING.md)** - Contribution guidelines and development setup
 - **[CODE_OF_CONDUCT.md](docs/policies/CODE_OF_CONDUCT.md)** - Community guidelines
 - **[DEPLOYMENT_GUIDE.md](docs/guides/DEPLOYMENT_GUIDE.md)** - Deployment instructions (requires trained model)
-- **[EVALUATION_REPORT.md](docs/reports/EVALUATION_REPORT.md)** - Evaluation scripts and utilities
-- **[AUDIT_REPORT.md](docs/reports/AUDIT_REPORT.md)** - Security audit documentation
 - **[IMPROVEMENTS.md](docs/reports/IMPROVEMENTS.md)** - Recent improvements and changes
 - **[scripts/examples.py](scripts/examples.py)** - Code examples and usage patterns
 

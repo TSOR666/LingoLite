@@ -153,8 +153,9 @@ docker run -d \
   -p 8000:8000 \
   -v $(pwd)/models:/app/models \
   -v $(pwd)/tokenizer:/app/tokenizer \
-  -e MODEL_SIZE=small \
-  -e DEVICE=cpu \
+  -e LINGOLITE_MODEL_SIZE=small \
+  -e LINGOLITE_DEVICE=cpu \
+  -e LINGOLITE_ALLOWED_ORIGINS=http://localhost,http://127.0.0.1 \
   lingolite:latest
 ```
 
@@ -167,8 +168,9 @@ docker run -d \
   -p 8000:8000 \
   -v $(pwd)/models:/app/models \
   -v $(pwd)/tokenizer:/app/tokenizer \
-  -e MODEL_SIZE=small \
-  -e DEVICE=cuda \
+  -e LINGOLITE_MODEL_SIZE=small \
+  -e LINGOLITE_DEVICE=cuda \
+  -e LINGOLITE_ALLOWED_ORIGINS=https://example.com \
   lingolite:latest
 ```
 
@@ -304,10 +306,12 @@ spec:
         ports:
         - containerPort: 8000
         env:
-        - name: MODEL_SIZE
+        - name: LINGOLITE_MODEL_SIZE
           value: "small"
-        - name: DEVICE
+        - name: LINGOLITE_DEVICE
           value: "cuda"
+        - name: LINGOLITE_ALLOWED_ORIGINS
+          value: "https://api.example.com"
         resources:
           requests:
             memory: "4Gi"
@@ -733,7 +737,7 @@ translations = tokenizer.batch_decode(outputs.tolist())
 For issues and questions:
 
 - **GitHub Issues:** https://github.com/TSOR666/LingoLite/issues
-- **Documentation:** See README.md, AUDIT_REPORT.md, EVALUATION_REPORT.md
+- **Documentation:** See README.md, SECURITY.md, COMMUNITY_DEPLOYMENT_REVIEW.md
 - **Examples:** See scripts/examples.py
 
 ---
