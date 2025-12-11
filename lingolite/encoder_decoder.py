@@ -251,8 +251,8 @@ class TransformerEncoder(nn.Module):
             )
             for _ in range(n_layers)
         ]
+        # Track layers only via the ModuleList to avoid duplicate references
         self.layers = nn.ModuleList(layers)
-        self._encoder_layers: List[EncoderLayer] = layers
         
         # Final normalization
         self.final_norm = RMSNorm(d_model)
@@ -283,9 +283,9 @@ class TransformerEncoder(nn.Module):
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             # Convert 0/1 to -inf/0 for masking
             attention_mask = (1.0 - attention_mask) * torch.finfo(x.dtype).min
-        
+
         # Apply encoder layers
-        for layer in self._encoder_layers:
+        for layer in self.layers:
             x = layer(x, attention_mask=attention_mask, rope=self.rope)
         
         # Final normalization
