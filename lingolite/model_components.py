@@ -22,6 +22,8 @@ class RMSNorm(nn.Module):
     
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
+        if eps <= 0:
+            raise ValueError(f"eps must be > 0 for numerical stability, got {eps}")
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         
@@ -63,6 +65,10 @@ class RotaryPositionEmbedding(nn.Module):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError(f"RotaryPositionEmbedding expects even dim, got {dim}")
+        if max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+        if base <= 0:
+            raise ValueError(f"base must be > 0 for frequency computation, got {base}")
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base

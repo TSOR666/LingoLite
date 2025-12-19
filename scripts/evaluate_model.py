@@ -258,7 +258,8 @@ def evaluate_model(
 
     # Load model
     logger.info(f"Loading model from {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
+    # SECURITY: Use weights_only=True to prevent arbitrary code execution
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
 
     # Extract config from checkpoint
     if 'config' in checkpoint:
