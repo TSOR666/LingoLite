@@ -226,12 +226,13 @@ class TransformerEncoder(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         self.d_model = d_model
-        
+        self.embedding_scale = math.sqrt(d_model)  # Cache for performance
+
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
-        
+
         # Rotary position embeddings
         self.rope = RotaryPositionEmbedding(
             dim=d_model // n_heads,
@@ -270,8 +271,8 @@ class TransformerEncoder(nn.Module):
         Returns:
             encoder_output: (batch, seq_len, d_model)
         """
-        # Embed tokens
-        x: torch.Tensor = self.embedding(input_ids) * math.sqrt(self.d_model)
+        # Embed tokens (use cached sqrt for performance)
+        x: torch.Tensor = self.embedding(input_ids) * self.embedding_scale
         x = self.dropout(x)
         
         # Create attention mask for padding
@@ -310,10 +311,11 @@ class TransformerDecoder(nn.Module):
         tie_embeddings: bool = True,
     ):
         super().__init__()
-        
+
         self.d_model = d_model
+        self.embedding_scale = math.sqrt(d_model)  # Cache for performance
         self.tie_embeddings = tie_embeddings
-        
+
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
         
@@ -371,8 +373,8 @@ class TransformerDecoder(nn.Module):
             logits: (batch, tgt_len, vocab_size)
             updated_caches: List of LayerKVCache if use_cache=True, else None
         """
-        # Embed tokens
-        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        # Embed tokens (use cached sqrt for performance)
+        x = self.embedding(input_ids) * self.embedding_scale
         x = self.dropout(x)
 
         # Create self-attention mask (causal mask is handled in layer)

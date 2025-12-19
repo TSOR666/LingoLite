@@ -343,7 +343,8 @@ def compare_quantization_methods(
 
     # Load model
     logger.info(f"Loading model from {model_path}")
-    checkpoint = torch.load(model_path, map_location='cpu')
+    # SECURITY: Use weights_only=True to prevent arbitrary code execution
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
 
     if 'config' in checkpoint:
         config = checkpoint['config']
@@ -475,7 +476,8 @@ def main() -> None:
         )
     elif args.method == 'dynamic_int8':
         # Load and quantize
-        checkpoint = torch.load(args.model, map_location='cpu')
+        # SECURITY: Use weights_only=True to prevent arbitrary code execution
+        checkpoint = torch.load(args.model, map_location='cpu', weights_only=True)
         if 'config' in checkpoint:
             model = MobileTranslationModel(**checkpoint['config'])
         else:
@@ -489,7 +491,8 @@ def main() -> None:
 
     elif args.method == 'dynamic_fp16':
         # Load and quantize
-        checkpoint = torch.load(args.model, map_location='cpu')
+        # SECURITY: Use weights_only=True to prevent arbitrary code execution
+        checkpoint = torch.load(args.model, map_location='cpu', weights_only=True)
         if 'config' in checkpoint:
             model = MobileTranslationModel(**checkpoint['config'])
         else:

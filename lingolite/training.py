@@ -328,7 +328,8 @@ class TranslationTrainer:
     def load_checkpoint(self, filename: str) -> None:
         """Load model checkpoint."""
         load_path = self.save_dir / filename
-        checkpoint = torch.load(load_path, map_location=self.device)
+        # SECURITY: Use weights_only=True to prevent arbitrary code execution
+        checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
