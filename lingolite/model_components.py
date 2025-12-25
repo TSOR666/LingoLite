@@ -34,14 +34,18 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor (..., dim)
         """
-        # Compute RMS
-        x_float = x.float()  # compute mean in float32 for stability under mixed precision
+        # Compute RMS in float32 for stability under mixed precision
+        input_dtype = x.dtype
+        x_float = x.float()  # (..., dim) -> (..., dim) in float32
+        # Compute mean of squared values: (..., dim) -> (..., 1)
         rms = torch.sqrt(torch.mean(x_float ** 2, dim=-1, keepdim=True) + self.eps)
-        rms = rms.to(dtype=x.dtype)
-        
-        # Normalize and scale
-        x_normed = x / rms
-        return self.weight * x_normed
+
+        # Normalize in float32 to avoid precision loss, then convert back
+        # (..., dim) / (..., 1) -> (..., dim)
+        x_normed = x_float / rms
+        # Apply learned scale and convert back to input dtype
+        # weight: (dim,) broadcasts to (..., dim)
+        return (self.weight * x_normed).to(dtype=input_dtype)
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -373,19 +377,26 @@ class SwiGLU_FFN(nn.Module):
         """
         Args:
             x: (batch, seq_len, d_model)
-        
+
         Returns:
             output: (batch, seq_len, d_model)
         """
-        # SwiGLU activation
-        gate: torch.Tensor = F.silu(self.gate_proj(x))  # Swish activation
+        # SwiGLU activation with shape annotations
+        # gate_proj: (B, L, d_model) -> (B, L, d_ff)
+        gate_out: torch.Tensor = self.gate_proj(x)
+        gate: torch.Tensor = F.silu(gate_out)  # Swish activation
+
+        # up_proj: (B, L, d_model) -> (B, L, d_ff)
         up: torch.Tensor = self.up_proj(x)
-        hidden: torch.Tensor = gate * up  # Gated activation
-        
-        # Project back down
+
+        # Gated activation: (B, L, d_ff) * (B, L, d_ff) -> (B, L, d_ff)
+        # Upcast to float32 for stability, then back to original dtype
+        hidden: torch.Tensor = (gate.float() * up.float()).to(dtype=x.dtype)
+
+        # Project back down: (B, L, d_ff) -> (B, L, d_model)
         output: torch.Tensor = self.down_proj(hidden)
         output = self.dropout(output)
-        
+
         return output
 
 
