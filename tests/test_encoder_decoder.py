@@ -48,15 +48,22 @@ class TestEncoderLayer:
     def test_attention_mask_applied(self, encoder_layer: EncoderLayer) -> None:
         """Attention mask should affect output."""
         encoder_layer.eval()
-        
+
         x = torch.randn(2, 10, 64)
-        mask_full = torch.ones(2, 10)
-        mask_partial = torch.ones(2, 10)
-        mask_partial[:, 5:] = 0
-        
+
+        # EncoderLayer expects attention_mask in format (batch, 1, seq_len, seq_len)
+        # or broadcastable shape. Create additive mask: 0 = attend, -inf = masked
+
+        # Full attention (no masking)
+        mask_full = torch.zeros(2, 1, 1, 10)  # All zeros = full attention
+
+        # Partial attention (mask second half of keys)
+        mask_partial = torch.zeros(2, 1, 1, 10)
+        mask_partial[:, :, :, 5:] = float('-inf')  # Mask out positions 5-9
+
         output_full = encoder_layer(x, attention_mask=mask_full)
         output_partial = encoder_layer(x, attention_mask=mask_partial)
-        
+
         # Outputs should be different with different masks
         assert not torch.allclose(output_full, output_partial)
 
