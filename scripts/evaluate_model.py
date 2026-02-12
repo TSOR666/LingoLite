@@ -7,9 +7,9 @@ Evaluates trained LingoLite models on test datasets
 import torch
 import argparse
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple, cast
 import json
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 try:
     import sacrebleu
@@ -17,7 +17,7 @@ except ImportError:
     print("ERROR: sacrebleu not installed. Install with: pip install sacrebleu")
     exit(1)
 
-from lingolite.mobile_translation_model import MobileTranslationModel
+from lingolite.mobile_translation_model import MobileTranslationModel, create_model
 from lingolite.translation_tokenizer import TranslationTokenizer
 from lingolite.utils import logger
 
@@ -67,6 +67,8 @@ def translate_batch(
     batch_size: int = 32,
     max_length: int = 128,
     use_cache: bool = True,
+    src_lang: str = 'en',
+    tgt_lang: str = 'es',
 ) -> List[str]:
     """
     Translate a batch of sentences.
@@ -79,6 +81,8 @@ def translate_batch(
         batch_size: Batch size for translation
         max_length: Maximum generation length
         use_cache: Whether to use KV cache for faster generation
+        src_lang: Source language code used for tokenizer formatting
+        tgt_lang: Target language code used for tokenizer formatting
 
     Returns:
         translations: List of translated sentences
@@ -91,13 +95,16 @@ def translate_batch(
             batch = source_sentences[i:i + batch_size]
 
             # Tokenize
-            src_ids, src_mask = tokenizer.encode_batch(
+            encoded = tokenizer.batch_encode(
                 batch,
+                padding=True,
                 max_length=max_length,
-                return_tensors=True
+                return_tensors=True,
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
             )
-            src_ids = src_ids.to(device)
-            src_mask = src_mask.to(device)
+            src_ids = cast(torch.Tensor, encoded['input_ids']).to(device)
+            src_mask = cast(torch.Tensor, encoded['attention_mask']).to(device)
 
             # Generate translations
             if use_cache:
@@ -118,7 +125,7 @@ def translate_batch(
                 )
 
             # Decode
-            batch_translations = tokenizer.decode_batch(generated)
+            batch_translations = tokenizer.batch_decode(generated.tolist())
             translations.extend(batch_translations)
 
     return translations
@@ -226,6 +233,8 @@ def evaluate_model(
     use_cache: bool = True,
     device: Optional[str] = None,
     save_translations: bool = False,
+    src_lang: str = 'en',
+    tgt_lang: str = 'es',
 ) -> Dict[str, float]:
     """
     Evaluate translation model with BLEU score.
@@ -242,40 +251,39 @@ def evaluate_model(
         use_cache: Whether to use KV cache
         device: Device to run on (cuda/cpu)
         save_translations: Whether to save translations to file
+        src_lang: Source language code for tokenization
+        tgt_lang: Target language code for tokenization
 
     Returns:
         Dictionary with evaluation metrics
     """
     # Setup device
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
-    logger.info(f"Using device: {device}")
+    device_obj = torch.device(device) if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device_obj}")
 
     # Load tokenizer
     logger.info(f"Loading tokenizer from {tokenizer_path}")
-    tokenizer = TranslationTokenizer.load(tokenizer_path)
+    tokenizer = TranslationTokenizer.from_pretrained(tokenizer_path)
 
     # Load model
     logger.info(f"Loading model from {model_path}")
-    # SECURITY: Use weights_only=True to prevent arbitrary code execution
-    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(model_path, map_location=device_obj)
 
     # Extract config from checkpoint
-    if 'config' in checkpoint:
+    if isinstance(checkpoint, dict) and 'config' in checkpoint:
         config = checkpoint['config']
         model = MobileTranslationModel(**config)
     else:
         # Assume default config
         model = MobileTranslationModel(
-            vocab_size=tokenizer.vocab_size,
+            vocab_size=tokenizer.get_vocab_size(),
             d_model=512,
             n_encoder_layers=6,
             n_decoder_layers=6,
         )
 
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
+    model.to(device_obj)
     model.eval()
 
     logger.info(f"Model loaded: {model.count_parameters()['total']:,} parameters")
@@ -291,19 +299,24 @@ def evaluate_model(
         model=model,
         tokenizer=tokenizer,
         source_sentences=source_sentences,
-        device=device,
+        device=device_obj,
         batch_size=batch_size,
         max_length=max_length,
         use_cache=use_cache,
+        src_lang=src_lang,
+        tgt_lang=tgt_lang,
     )
+
+    # Prepare references as list[list[str]] for sacrebleu
+    references: List[List[str]] = [[ref] for ref in reference_sentences]
 
     # Compute BLEU
     logger.info("Computing BLEU score...")
-    bleu_metrics = compute_bleu_metrics(translations, reference_sentences)
+    bleu_metrics = compute_bleu_metrics(translations, references)
 
     # Compute chrF
     logger.info("Computing chrF score...")
-    chrf_score = compute_chrf(translations, reference_sentences)
+    chrf_score = compute_chrf(translations, references)
 
     # Combine metrics
     metrics = {
@@ -336,7 +349,7 @@ def evaluate_model(
         logger.info(f"Results saved to {output_file}")
 
     # Save translations if requested
-    if save_translations:
+    if save_translations and output_file is not None:
         trans_file = output_file.parent / f"{output_file.stem}_translations.txt"
         with open(trans_file, 'w', encoding='utf-8') as f:
             for trans in translations:
@@ -346,7 +359,7 @@ def evaluate_model(
     return metrics
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate translation model with BLEU")
     parser.add_argument('--model', type=Path, required=True, help="Path to model checkpoint")
     parser.add_argument('--tokenizer', type=Path, required=True, help="Path to tokenizer directory")
@@ -359,6 +372,8 @@ def main():
     parser.add_argument('--no-cache', action='store_true', help="Disable KV cache")
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], help="Device to use")
     parser.add_argument('--save-translations', action='store_true', help="Save translations to file")
+    parser.add_argument('--src-lang', type=str, default='en', help="Source language code for tokenization")
+    parser.add_argument('--tgt-lang', type=str, default='es', help="Target language code for tokenization")
 
     args = parser.parse_args()
 
@@ -374,6 +389,8 @@ def main():
         use_cache=not args.no_cache,
         device=args.device,
         save_translations=args.save_translations,
+        src_lang=args.src_lang,
+        tgt_lang=args.tgt_lang,
     )
 
 

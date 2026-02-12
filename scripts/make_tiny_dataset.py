@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-def main():
+def main() -> None:
     data = [
         {"src_text": "Hello", "tgt_text": "Hola", "src_lang": "en", "tgt_lang": "es"},
         {"src_text": "Good morning", "tgt_text": "Buenos dias", "src_lang": "en", "tgt_lang": "es"},

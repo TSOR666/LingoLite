@@ -7,12 +7,12 @@ import torch
 import torch.nn as nn
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, cast
 import json
 
 try:
-    import onnx
-    import onnxruntime as ort
+    import onnx  # type: ignore[import-not-found]
+    import onnxruntime as ort  # type: ignore[import-not-found]
     ONNX_AVAILABLE = True
 except ImportError:
     print("WARNING: ONNX not installed. Install with: pip install onnx onnxruntime")
@@ -43,7 +43,7 @@ class EncoderWrapper(nn.Module):
         Returns:
             encoder_output: (batch, seq_len, d_model)
         """
-        return self.encoder(input_ids, attention_mask)
+        return cast(torch.Tensor, self.encoder(input_ids, attention_mask))
 
 
 class DecoderWrapper(nn.Module):
@@ -77,7 +77,7 @@ class DecoderWrapper(nn.Module):
             cross_attention_mask,
             use_cache=False,
         )
-        return logits
+        return cast(torch.Tensor, logits)
 
 
 def export_encoder_to_onnx(
@@ -256,8 +256,8 @@ def optimize_onnx_model(
         raise ImportError("ONNX not installed")
 
     try:
-        from onnxruntime.transformers import optimizer
-        from onnxruntime.transformers.fusion_options import FusionOptions
+        from onnxruntime.transformers import optimizer  # type: ignore[import-not-found]
+        from onnxruntime.transformers.fusion_options import FusionOptions  # type: ignore[import-not-found]
 
         logger.info(f"Optimizing ONNX model: {input_path}")
 
@@ -467,7 +467,7 @@ def test_onnx_inference(
     logger.info("ONNX inference test successful!")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Export translation model to ONNX")
     parser.add_argument('--model', type=Path, required=True, help="Path to model checkpoint")
     parser.add_argument('--output-dir', type=Path, required=True, help="Directory to save ONNX models")

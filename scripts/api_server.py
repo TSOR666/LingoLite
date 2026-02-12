@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 import torch
 import time
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 import os
 
@@ -174,6 +174,8 @@ async def startup_event() -> None:
                 raise RuntimeError("Tokenizer not found at ./tokenizer")
             logger.info("Loading tokenizer...")
             tokenizer = TranslationTokenizer.from_pretrained(str(tokenizer_path))
+        if tokenizer is None:
+            raise RuntimeError("Tokenizer failed to load")
         logger.info(f"Tokenizer ready: vocab_size={tokenizer.get_vocab_size()}")
 
         # Model
@@ -219,7 +221,7 @@ async def shutdown_event() -> None:
 
 
 @app.get("/", response_model=dict)
-async def root() -> dict:
+async def root() -> Dict[str, Any]:
     return {
         "name": "LingoLite Translation API",
         "version": "0.1.0",
@@ -240,12 +242,12 @@ async def health_check() -> HealthResponse:
 
 
 @app.get("/health/liveness")
-async def liveness() -> dict:
+async def liveness() -> Dict[str, str]:
     return {"status": "alive"}
 
 
 @app.get("/health/readiness")
-async def readiness() -> dict:
+async def readiness() -> Dict[str, str]:
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Service not ready")
     return {"status": "ready"}
@@ -323,19 +325,19 @@ async def translate(request: TranslationRequest) -> TranslationResponse:
 
 
 @app.get("/languages", response_model=dict)
-async def get_supported_languages() -> dict:
+async def get_supported_languages() -> Dict[str, Any]:
     if tokenizer is None:
         raise HTTPException(status_code=503, detail="Tokenizer not loaded")
     return {"languages": tokenizer.languages, "count": len(tokenizer.languages)}
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=ErrorResponse(error=exc.detail).dict())
 
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
+async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(status_code=500, content=ErrorResponse(error="Internal server error").dict())
 
@@ -343,8 +345,8 @@ async def general_exception_handler(request: Request, exc: Exception):
 def main() -> None:
     import uvicorn
 
-    # SECURITY: Default to localhost-only binding to prevent unauthorized access
-    # Set LINGOLITE_BIND_HOST=0.0.0.0 to expose externally (requires proper firewall/auth)
+    # SECURITY: Default to localhost-only binding
+    # Set LINGOLITE_BIND_HOST=0.0.0.0 to expose externally (with proper firewall/VPN)
     host = os.getenv("LINGOLITE_BIND_HOST", "127.0.0.1")
     port = int(os.getenv("LINGOLITE_PORT", "8000"))
 
@@ -360,4 +362,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

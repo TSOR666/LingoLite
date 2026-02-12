@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Optional, Tuple, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from .generation_utils import KVCache
@@ -19,11 +19,12 @@ class RMSNorm(nn.Module):
     Simpler and faster than LayerNorm, no bias/mean subtraction.
     Used in: LLaMA, Mistral, Gemma, etc.
     """
-    
+
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
+        # Validate eps is positive (required for numerical stability)
         if eps <= 0:
-            raise ValueError(f"eps must be > 0 for numerical stability, got {eps}")
+            raise ValueError(f"eps must be positive, got {eps}")
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         
@@ -34,18 +35,15 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor (..., dim)
         """
-        # Compute RMS in float32 for stability under mixed precision
-        input_dtype = x.dtype
-        x_float = x.float()  # (..., dim) -> (..., dim) in float32
-        # Compute mean of squared values: (..., dim) -> (..., 1)
+        # Compute RMS in float32 for stability, then return to input dtype
+        x_float = x.float()
         rms = torch.sqrt(torch.mean(x_float ** 2, dim=-1, keepdim=True) + self.eps)
-
-        # Normalize in float32 to avoid precision loss, then convert back
-        # (..., dim) / (..., 1) -> (..., dim)
-        x_normed = x_float / rms
-        # Apply learned scale and convert back to input dtype
-        # weight: (dim,) broadcasts to (..., dim)
-        return (self.weight * x_normed).to(dtype=input_dtype)
+        rms = rms.to(dtype=x.dtype)
+        
+        # Normalize and scale while preserving input dtype
+        weight = self.weight.to(dtype=x.dtype)
+        x_normed = x / rms
+        return weight * x_normed
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -69,10 +67,12 @@ class RotaryPositionEmbedding(nn.Module):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError(f"RotaryPositionEmbedding expects even dim, got {dim}")
-        if max_seq_len <= 0:
-            raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+        # Validate base is positive (required for frequency computation)
         if base <= 0:
-            raise ValueError(f"base must be > 0 for frequency computation, got {base}")
+            raise ValueError(f"base must be positive, got {base}")
+        # Validate max_seq_len is positive
+        if max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
@@ -309,8 +309,19 @@ class GroupedQueryAttention(nn.Module):
             scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         if attention_mask is not None:
+            # Support masks shaped (B, kv_len), (B, q_len, kv_len), or (B, 1, q_len, kv_len)
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask[:, None, None, :]
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask[:, None, :, :]
+            elif attention_mask.dim() != 4:
+                raise ValueError(
+                    f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
+                )
             attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
-            scores = scores + attention_mask
+            # Expect 1 for valid tokens, 0 for masked; convert to additive mask
+            padding_mask = attention_mask == 0
+            scores = scores.masked_fill(padding_mask, float('-inf'))
 
         # Handle fully masked rows explicitly to avoid uniform attention on padding
         fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
@@ -381,20 +392,21 @@ class SwiGLU_FFN(nn.Module):
         Returns:
             output: (batch, seq_len, d_model)
         """
-        # SwiGLU activation with shape annotations
-        # gate_proj: (B, L, d_model) -> (B, L, d_ff)
-        gate_out: torch.Tensor = self.gate_proj(x)
-        gate: torch.Tensor = F.silu(gate_out)  # Swish activation
+        def _linear(module: nn.Linear, inp: torch.Tensor) -> torch.Tensor:
+            weight = getattr(module, "weight", None)
+            bias = getattr(module, "bias", None)
+            # Quantized dynamic linear modules expose weight as a callable, so fall back to module(inp)
+            if isinstance(weight, torch.Tensor):
+                bias_cast = bias.to(dtype=inp.dtype) if isinstance(bias, torch.Tensor) else bias
+                return F.linear(inp, weight.to(dtype=inp.dtype), bias_cast)
+            return cast(torch.Tensor, module(inp))
 
-        # up_proj: (B, L, d_model) -> (B, L, d_ff)
-        up: torch.Tensor = self.up_proj(x)
-
-        # Gated activation: (B, L, d_ff) * (B, L, d_ff) -> (B, L, d_ff)
-        # Upcast to float32 for stability, then back to original dtype
-        hidden: torch.Tensor = (gate.float() * up.float()).to(dtype=x.dtype)
-
-        # Project back down: (B, L, d_ff) -> (B, L, d_model)
-        output: torch.Tensor = self.down_proj(hidden)
+        gate: torch.Tensor = F.silu(_linear(self.gate_proj, x))  # Swish activation
+        up: torch.Tensor = _linear(self.up_proj, x)
+        hidden: torch.Tensor = gate * up  # Gated activation
+        
+        # Project back down
+        output: torch.Tensor = _linear(self.down_proj, hidden)
         output = self.dropout(output)
 
         return output

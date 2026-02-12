@@ -65,8 +65,8 @@ def compute_bleu(
     """Compute corpus BLEU using sacrebleu."""
 
     return sacrebleu.corpus_bleu(
-        sys_stream=hypotheses,
-        ref_streams=list(references),
+        hypotheses,
+        list(references),
         smooth_method=smooth_method,
         lowercase=lowercase,
         tokenize=tokenizer,
