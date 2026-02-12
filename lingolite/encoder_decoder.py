@@ -21,12 +21,12 @@ if TYPE_CHECKING:
 class EncoderLayer(nn.Module):
     """
     Single Transformer Encoder Layer.
-    
+
     Architecture:
         x = x + SelfAttention(Norm(x))
         x = x + FFN(Norm(x))
     """
-    
+
     def __init__(
         self,
         d_model: int,
@@ -34,7 +34,7 @@ class EncoderLayer(nn.Module):
         n_kv_heads: int,
         d_ff: int,
         dropout: float = 0.1,
-    ):
+    ) -> None:
         super().__init__()
         
         # Self-attention (bidirectional for encoder)
@@ -89,13 +89,13 @@ class EncoderLayer(nn.Module):
 class DecoderLayer(nn.Module):
     """
     Single Transformer Decoder Layer.
-    
+
     Architecture:
         x = x + MaskedSelfAttention(Norm(x))
         x = x + CrossAttention(Norm(x), encoder_output)
         x = x + FFN(Norm(x))
     """
-    
+
     def __init__(
         self,
         d_model: int,
@@ -103,7 +103,7 @@ class DecoderLayer(nn.Module):
         n_kv_heads: int,
         d_ff: int,
         dropout: float = 0.1,
-    ):
+    ) -> None:
         super().__init__()
         
         # Masked self-attention (causal)
@@ -233,7 +233,7 @@ class TransformerEncoder(nn.Module):
 
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
-        
+
         # Rotary position embeddings
         self.rope = RotaryPositionEmbedding(
             dim=d_model // n_heads,
@@ -314,6 +314,7 @@ class TransformerDecoder(nn.Module):
         super().__init__()
 
         self.d_model = d_model
+        self.embedding_scale = math.sqrt(d_model)  # Cache for performance
         self.tie_embeddings = tie_embeddings
         # Cache scaling factor to avoid computing sqrt every forward pass
         self.embedding_scale = math.sqrt(d_model)

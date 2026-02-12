@@ -160,7 +160,8 @@ def main() -> None:
     from lingolite.mobile_translation_model import create_model
 
     model = create_model(vocab_size=args.vocab_size, model_size=args.model_size)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    # SECURITY: Use weights_only=True to prevent arbitrary code execution
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         checkpoint = checkpoint["state_dict"]
     model.load_state_dict(checkpoint, strict=False)

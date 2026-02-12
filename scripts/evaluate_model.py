@@ -103,21 +103,8 @@ def translate_batch(
                 src_lang=src_lang,
                 tgt_lang=tgt_lang,
             )
-<<<<<<< Updated upstream
             src_ids = cast(torch.Tensor, encoded['input_ids']).to(device)
             src_mask = cast(torch.Tensor, encoded['attention_mask']).to(device)
-=======
-            src_ids = encoded['input_ids']
-            src_mask = encoded.get('attention_mask')
-            if not isinstance(src_ids, torch.Tensor):
-                src_ids = torch.tensor(src_ids, dtype=torch.long)
-            if src_mask is None:
-                src_mask = torch.ones_like(src_ids)
-            elif not isinstance(src_mask, torch.Tensor):
-                src_mask = torch.tensor(src_mask, dtype=torch.long)
-            src_ids = src_ids.to(device)
-            src_mask = src_mask.to(device)
->>>>>>> Stashed changes
 
             # Generate translations
             if use_cache:
@@ -287,7 +274,6 @@ def evaluate_model(
         config = checkpoint['config']
         model = MobileTranslationModel(**config)
     else:
-<<<<<<< Updated upstream
         # Assume default config
         model = MobileTranslationModel(
             vocab_size=tokenizer.get_vocab_size(),
@@ -298,19 +284,6 @@ def evaluate_model(
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device_obj)
-=======
-        # Fall back to the default preset if config is unavailable.
-        model = create_model(
-            vocab_size=tokenizer.get_vocab_size(),
-            model_size='small',
-        )
-
-    state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
-    if not isinstance(state_dict, dict):
-        raise ValueError("Checkpoint must contain a valid state_dict or model_state_dict")
-    model.load_state_dict(state_dict)
-    model.to(device)
->>>>>>> Stashed changes
     model.eval()
 
     logger.info(f"Model loaded: {model.count_parameters()['total']:,} parameters")
@@ -376,17 +349,8 @@ def evaluate_model(
         logger.info(f"Results saved to {output_file}")
 
     # Save translations if requested
-<<<<<<< Updated upstream
     if save_translations and output_file is not None:
         trans_file = output_file.parent / f"{output_file.stem}_translations.txt"
-=======
-    if save_translations:
-        if output_file is not None:
-            output_base = Path(output_file)
-            trans_file = output_base.parent / f"{output_base.stem}_translations.txt"
-        else:
-            trans_file = model_path.parent / f"{model_path.stem}_translations.txt"
->>>>>>> Stashed changes
         with open(trans_file, 'w', encoding='utf-8') as f:
             for trans in translations:
                 f.write(trans + '\n')

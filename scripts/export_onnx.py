@@ -314,7 +314,8 @@ def export_full_model(
 
     # Load model
     logger.info(f"Loading model from {model_path}")
-    checkpoint = torch.load(model_path, map_location='cpu')
+    # SECURITY: Use weights_only=True to prevent arbitrary code execution
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
 
     if 'config' in checkpoint:
         config = checkpoint['config']

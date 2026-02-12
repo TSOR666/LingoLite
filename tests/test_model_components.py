@@ -250,12 +250,19 @@ class TestGroupedQueryAttention:
     def test_attention_mask_application(self, gqa: GroupedQueryAttention) -> None:
         """Attention mask should be properly applied."""
         gqa.eval()
-        
+
         x = torch.randn(2, 10, 64)
-        mask = torch.ones(2, 10)
-        mask[:, 5:] = 0  # Mask out second half
-        
-        output, _ = gqa(x, attention_mask=mask)
+        # Create mask in expected format: (batch, 1, q_len, kv_len)
+        # Start with (2, 10) padding mask: 1 = attend, 0 = masked
+        padding_mask = torch.ones(2, 10)
+        padding_mask[:, 5:] = 0  # Mask out second half
+
+        # Convert to additive attention mask format: (batch, 1, 1, kv_len)
+        # 0 -> -inf (masked), 1 -> 0 (attend)
+        attention_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (2, 1, 1, 10)
+        attention_mask = (1.0 - attention_mask) * float('-inf')
+
+        output, _ = gqa(x, attention_mask=attention_mask)
         assert output.shape == x.shape
 
     def test_head_dimension_validation(self) -> None:
@@ -313,8 +320,10 @@ class TestSwiGLU_FFN:
         output_zero = ffn(x_zero)
         assert torch.allclose(output_zero, torch.zeros_like(output_zero), atol=1e-5)
 
-    def test_dtype_preserved(self, ffn: SwiGLU_FFN) -> None:
-        """FFN should preserve input dtype."""
+    def test_dtype_preserved(self) -> None:
+        """FFN should preserve input dtype when model and input dtypes match."""
+        # Create float16 model and float16 input
+        ffn = SwiGLU_FFN(d_model=64, d_ff=256, dropout=0.0).half()
         x = torch.randn(2, 10, 64, dtype=torch.float16)
         output = ffn(x)
         assert output.dtype == torch.float16

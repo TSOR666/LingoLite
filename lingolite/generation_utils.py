@@ -74,11 +74,11 @@ class KVCache:
     ) -> 'KVCache':
         """
         Update cache with new key-value pairs.
-        
+
         Args:
-            new_key: New key tensor (batch, n_heads, new_len, head_dim)
-            new_value: New value tensor (batch, n_heads, new_len, head_dim)
-        
+            new_key: New key tensor (batch, n_kv_heads, new_len, head_dim)
+            new_value: New value tensor (batch, n_kv_heads, new_len, head_dim)
+
         Returns:
             Updated KVCache instance
         """

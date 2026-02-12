@@ -388,7 +388,7 @@ class SwiGLU_FFN(nn.Module):
         """
         Args:
             x: (batch, seq_len, d_model)
-        
+
         Returns:
             output: (batch, seq_len, d_model)
         """
@@ -408,7 +408,7 @@ class SwiGLU_FFN(nn.Module):
         # Project back down
         output: torch.Tensor = _linear(self.down_proj, hidden)
         output = self.dropout(output)
-        
+
         return output
 
 

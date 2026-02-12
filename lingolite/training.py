@@ -83,23 +83,11 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
             raise ValueError(f"Target language '{item['tgt_lang']}' not supported. Supported: {self.tokenizer.languages}")
         tgt_lang_id = self.tokenizer.token_to_id[f"<{item['tgt_lang']}>"]
         tgt_ids = [tgt_lang_id] + tgt_ids + [self.tokenizer.eos_token_id]
-<<<<<<< Updated upstream
         
         src_mask = [1] * len(src_ids)
         tgt_mask = [1] * len(tgt_ids)
         
         return {
-=======
-
-        # Provide both legacy (src_ids/tgt_ids) and standardized keys so
-        # downstream pipelines can consume this dataset without schema drift.
-        src_mask = [1] * len(src_ids)
-        tgt_mask = [1] * len(tgt_ids)
-
-        return {
-            'src_ids': src_ids,
-            'tgt_ids': tgt_ids,
->>>>>>> Stashed changes
             'src_input_ids': src_ids,
             'tgt_input_ids': tgt_ids,
             'src_attention_mask': src_mask,
@@ -141,7 +129,6 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
     tgt_mask_key = 'tgt_attention_mask' if use_standard_keys else None
 
     # Find max lengths
-<<<<<<< Updated upstream
     def _get(key: str, item: Dict[str, List[int]]) -> List[int]:
         # Support both legacy keys ('src_ids') and new keys ('src_input_ids')
         if key in item:
@@ -151,10 +138,6 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
     
     max_src_len = max(len(_get('src_input_ids', item)) for item in batch)
     max_tgt_len = max(len(_get('tgt_input_ids', item)) for item in batch)
-=======
-    max_src_len = max(len(item[src_key]) for item in batch)
-    max_tgt_len = max(len(item[tgt_key]) for item in batch)
->>>>>>> Stashed changes
     
     # Pad sequences
     src_ids = []
@@ -164,11 +147,7 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
     
     for item in batch:
         # Pad source
-<<<<<<< Updated upstream
         src = _get('src_input_ids', item)
-=======
-        src = item[src_key]
->>>>>>> Stashed changes
         src_padding = [pad_token_id] * (max_src_len - len(src))
         src_ids.append(src + src_padding)
 
@@ -183,11 +162,7 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
         src_mask.append(src_mask_values + [0] * len(src_padding))
         
         # Pad target
-<<<<<<< Updated upstream
         tgt = _get('tgt_input_ids', item)
-=======
-        tgt = item[tgt_key]
->>>>>>> Stashed changes
         tgt_padding = [pad_token_id] * (max_tgt_len - len(tgt))
         tgt_ids.append(tgt + tgt_padding)
 
