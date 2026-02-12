@@ -17,7 +17,7 @@ except ImportError:
     print("ERROR: sacrebleu not installed. Install with: pip install sacrebleu")
     exit(1)
 
-from lingolite.mobile_translation_model import MobileTranslationModel
+from lingolite.mobile_translation_model import MobileTranslationModel, create_model
 from lingolite.translation_tokenizer import TranslationTokenizer
 from lingolite.utils import logger
 
@@ -67,6 +67,8 @@ def translate_batch(
     batch_size: int = 32,
     max_length: int = 128,
     use_cache: bool = True,
+    src_lang: str = 'en',
+    tgt_lang: str = 'es',
 ) -> List[str]:
     """
     Translate a batch of sentences.
@@ -79,6 +81,8 @@ def translate_batch(
         batch_size: Batch size for translation
         max_length: Maximum generation length
         use_cache: Whether to use KV cache for faster generation
+        src_lang: Source language code used for tokenizer formatting
+        tgt_lang: Target language code used for tokenizer formatting
 
     Returns:
         translations: List of translated sentences
@@ -93,11 +97,27 @@ def translate_batch(
             # Tokenize
             encoded = tokenizer.batch_encode(
                 batch,
+                padding=True,
                 max_length=max_length,
-                return_tensors=True
+                return_tensors=True,
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
             )
+<<<<<<< Updated upstream
             src_ids = cast(torch.Tensor, encoded['input_ids']).to(device)
             src_mask = cast(torch.Tensor, encoded['attention_mask']).to(device)
+=======
+            src_ids = encoded['input_ids']
+            src_mask = encoded.get('attention_mask')
+            if not isinstance(src_ids, torch.Tensor):
+                src_ids = torch.tensor(src_ids, dtype=torch.long)
+            if src_mask is None:
+                src_mask = torch.ones_like(src_ids)
+            elif not isinstance(src_mask, torch.Tensor):
+                src_mask = torch.tensor(src_mask, dtype=torch.long)
+            src_ids = src_ids.to(device)
+            src_mask = src_mask.to(device)
+>>>>>>> Stashed changes
 
             # Generate translations
             if use_cache:
@@ -118,7 +138,7 @@ def translate_batch(
                 )
 
             # Decode
-            batch_translations = tokenizer.decode_batch(generated)
+            batch_translations = tokenizer.batch_decode(generated.tolist())
             translations.extend(batch_translations)
 
     return translations
@@ -226,6 +246,8 @@ def evaluate_model(
     use_cache: bool = True,
     device: Optional[str] = None,
     save_translations: bool = False,
+    src_lang: str = 'en',
+    tgt_lang: str = 'es',
 ) -> Dict[str, float]:
     """
     Evaluate translation model with BLEU score.
@@ -242,6 +264,8 @@ def evaluate_model(
         use_cache: Whether to use KV cache
         device: Device to run on (cuda/cpu)
         save_translations: Whether to save translations to file
+        src_lang: Source language code for tokenization
+        tgt_lang: Target language code for tokenization
 
     Returns:
         Dictionary with evaluation metrics
@@ -259,10 +283,11 @@ def evaluate_model(
     checkpoint = torch.load(model_path, map_location=device_obj)
 
     # Extract config from checkpoint
-    if 'config' in checkpoint:
+    if isinstance(checkpoint, dict) and 'config' in checkpoint:
         config = checkpoint['config']
         model = MobileTranslationModel(**config)
     else:
+<<<<<<< Updated upstream
         # Assume default config
         model = MobileTranslationModel(
             vocab_size=tokenizer.get_vocab_size(),
@@ -273,6 +298,19 @@ def evaluate_model(
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device_obj)
+=======
+        # Fall back to the default preset if config is unavailable.
+        model = create_model(
+            vocab_size=tokenizer.get_vocab_size(),
+            model_size='small',
+        )
+
+    state_dict = checkpoint['model_state_dict'] if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
+    if not isinstance(state_dict, dict):
+        raise ValueError("Checkpoint must contain a valid state_dict or model_state_dict")
+    model.load_state_dict(state_dict)
+    model.to(device)
+>>>>>>> Stashed changes
     model.eval()
 
     logger.info(f"Model loaded: {model.count_parameters()['total']:,} parameters")
@@ -292,6 +330,8 @@ def evaluate_model(
         batch_size=batch_size,
         max_length=max_length,
         use_cache=use_cache,
+        src_lang=src_lang,
+        tgt_lang=tgt_lang,
     )
 
     # Prepare references as list[list[str]] for sacrebleu
@@ -336,8 +376,17 @@ def evaluate_model(
         logger.info(f"Results saved to {output_file}")
 
     # Save translations if requested
+<<<<<<< Updated upstream
     if save_translations and output_file is not None:
         trans_file = output_file.parent / f"{output_file.stem}_translations.txt"
+=======
+    if save_translations:
+        if output_file is not None:
+            output_base = Path(output_file)
+            trans_file = output_base.parent / f"{output_base.stem}_translations.txt"
+        else:
+            trans_file = model_path.parent / f"{model_path.stem}_translations.txt"
+>>>>>>> Stashed changes
         with open(trans_file, 'w', encoding='utf-8') as f:
             for trans in translations:
                 f.write(trans + '\n')
@@ -359,6 +408,8 @@ def main() -> None:
     parser.add_argument('--no-cache', action='store_true', help="Disable KV cache")
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], help="Device to use")
     parser.add_argument('--save-translations', action='store_true', help="Save translations to file")
+    parser.add_argument('--src-lang', type=str, default='en', help="Source language code for tokenization")
+    parser.add_argument('--tgt-lang', type=str, default='es', help="Target language code for tokenization")
 
     args = parser.parse_args()
 
@@ -374,6 +425,8 @@ def main() -> None:
         use_cache=not args.no_cache,
         device=args.device,
         save_translations=args.save_translations,
+        src_lang=args.src_lang,
+        tgt_lang=args.tgt_lang,
     )
 
 

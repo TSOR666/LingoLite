@@ -166,9 +166,10 @@ class MobileTranslationModel(nn.Module):
         sos_token_id: int = 1,
         eos_token_id: int = 2,
         temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 0.9,
+        top_k: int = 0,
+        top_p: float = 1.0,
         num_beams: int = 1,
+        do_sample: bool = False,
     ) -> torch.Tensor:
         """
         Generate translation (inference).
@@ -183,6 +184,7 @@ class MobileTranslationModel(nn.Module):
             top_k: Top-k sampling
             top_p: Nucleus (top-p) sampling
             num_beams: Number of beams for beam search (1 = greedy)
+            do_sample: Whether to sample stochastically (False = greedy/argmax)
         
         Returns:
             generated_ids: Generated token IDs (batch, gen_len)
@@ -201,6 +203,19 @@ class MobileTranslationModel(nn.Module):
         InputValidator.validate_positive_int(top_k, "top_k", min_value=0)
         InputValidator.validate_probability(top_p, "top_p")
         InputValidator.validate_positive_int(num_beams, "num_beams", min_value=1)
+        if not isinstance(do_sample, bool):
+            raise TypeError(f"do_sample must be a bool, got {type(do_sample).__name__}")
+
+        # num_beams is part of this API: route multi-beam decoding explicitly.
+        if num_beams > 1:
+            return self.generate_beam(
+                src_input_ids=src_input_ids,
+                src_attention_mask=src_attention_mask,
+                max_length=max_length,
+                num_beams=num_beams,
+                sos_token_id=sos_token_id,
+                eos_token_id=eos_token_id,
+            )
         
         logger.info(f"Generating translation: src_len={src_input_ids.shape[1]}, max_length={max_length}")
 
@@ -248,31 +263,37 @@ class MobileTranslationModel(nn.Module):
 
                 # Get logits for last position
                 next_token_logits = logits[:, -1, :] / temperature
-                
-                # Apply top-k filtering
-                if top_k > 0:
-                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, min(top_k, next_token_logits.shape[-1]))[0][..., -1, None]
-                    next_token_logits[indices_to_remove] = float('-inf')
-                
-                # Apply top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    
-                    # Remove tokens with cumulative probability above threshold
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    
-                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                    next_token_logits[indices_to_remove] = float('-inf')
-                
-                # Sample next token
-                probs = F.softmax(next_token_logits, dim=-1)
-                if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
-                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+
+                if do_sample:
+                    # Apply top-k filtering
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(
+                            next_token_logits,
+                            min(top_k, next_token_logits.shape[-1]),
+                        )[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+
+                    # Apply top-p (nucleus) filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                        # Remove tokens with cumulative probability above threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                        next_token_logits[indices_to_remove] = float('-inf')
+
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
+                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                    else:
+                        next_token = torch.multinomial(probs, num_samples=1)
                 else:
-                    next_token = torch.multinomial(probs, num_samples=1)
+                    # Default deterministic decoding for reproducible translation.
+                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
                 
                 # For finished sequences, use padding token
                 next_token = torch.where(

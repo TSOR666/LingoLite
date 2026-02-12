@@ -83,11 +83,23 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
             raise ValueError(f"Target language '{item['tgt_lang']}' not supported. Supported: {self.tokenizer.languages}")
         tgt_lang_id = self.tokenizer.token_to_id[f"<{item['tgt_lang']}>"]
         tgt_ids = [tgt_lang_id] + tgt_ids + [self.tokenizer.eos_token_id]
+<<<<<<< Updated upstream
         
         src_mask = [1] * len(src_ids)
         tgt_mask = [1] * len(tgt_ids)
         
         return {
+=======
+
+        # Provide both legacy (src_ids/tgt_ids) and standardized keys so
+        # downstream pipelines can consume this dataset without schema drift.
+        src_mask = [1] * len(src_ids)
+        tgt_mask = [1] * len(tgt_ids)
+
+        return {
+            'src_ids': src_ids,
+            'tgt_ids': tgt_ids,
+>>>>>>> Stashed changes
             'src_input_ids': src_ids,
             'tgt_input_ids': tgt_ids,
             'src_attention_mask': src_mask,
@@ -115,7 +127,21 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
             'tgt_attention_mask': torch.empty(0, 0, dtype=torch.float),
         }
     
+    # Support both dataset item formats:
+    # - legacy keys: src_ids/tgt_ids
+    # - standardized keys: src_input_ids/tgt_input_ids (+ optional masks)
+    use_standard_keys = (
+        'src_input_ids' in batch[0]
+        and 'tgt_input_ids' in batch[0]
+    )
+
+    src_key = 'src_input_ids' if use_standard_keys else 'src_ids'
+    tgt_key = 'tgt_input_ids' if use_standard_keys else 'tgt_ids'
+    src_mask_key = 'src_attention_mask' if use_standard_keys else None
+    tgt_mask_key = 'tgt_attention_mask' if use_standard_keys else None
+
     # Find max lengths
+<<<<<<< Updated upstream
     def _get(key: str, item: Dict[str, List[int]]) -> List[int]:
         # Support both legacy keys ('src_ids') and new keys ('src_input_ids')
         if key in item:
@@ -125,6 +151,10 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
     
     max_src_len = max(len(_get('src_input_ids', item)) for item in batch)
     max_tgt_len = max(len(_get('tgt_input_ids', item)) for item in batch)
+=======
+    max_src_len = max(len(item[src_key]) for item in batch)
+    max_tgt_len = max(len(item[tgt_key]) for item in batch)
+>>>>>>> Stashed changes
     
     # Pad sequences
     src_ids = []
@@ -134,16 +164,41 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
     
     for item in batch:
         # Pad source
+<<<<<<< Updated upstream
         src = _get('src_input_ids', item)
+=======
+        src = item[src_key]
+>>>>>>> Stashed changes
         src_padding = [pad_token_id] * (max_src_len - len(src))
         src_ids.append(src + src_padding)
-        src_mask.append([1] * len(src) + [0] * len(src_padding))
+
+        item_src_mask = item.get(src_mask_key) if src_mask_key is not None else None
+        if item_src_mask is None:
+            src_mask_values = [1] * len(src)
+        else:
+            # Clamp to source length and force binary mask semantics.
+            src_mask_values = [1 if int(v) != 0 else 0 for v in item_src_mask[:len(src)]]
+            if len(src_mask_values) < len(src):
+                src_mask_values += [1] * (len(src) - len(src_mask_values))
+        src_mask.append(src_mask_values + [0] * len(src_padding))
         
         # Pad target
+<<<<<<< Updated upstream
         tgt = _get('tgt_input_ids', item)
+=======
+        tgt = item[tgt_key]
+>>>>>>> Stashed changes
         tgt_padding = [pad_token_id] * (max_tgt_len - len(tgt))
         tgt_ids.append(tgt + tgt_padding)
-        tgt_mask.append([1] * len(tgt) + [0] * len(tgt_padding))
+
+        item_tgt_mask = item.get(tgt_mask_key) if tgt_mask_key is not None else None
+        if item_tgt_mask is None:
+            tgt_mask_values = [1] * len(tgt)
+        else:
+            tgt_mask_values = [1 if int(v) != 0 else 0 for v in item_tgt_mask[:len(tgt)]]
+            if len(tgt_mask_values) < len(tgt):
+                tgt_mask_values += [1] * (len(tgt) - len(tgt_mask_values))
+        tgt_mask.append(tgt_mask_values + [0] * len(tgt_padding))
     
     return {
         'src_input_ids': torch.tensor(src_ids, dtype=torch.long),
@@ -196,6 +251,8 @@ class TranslationTrainer:
         # Validate max_steps
         if max_steps <= 0:
             raise ValueError(f"max_steps must be positive, got {max_steps}")
+        if warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be non-negative, got {warmup_steps}")
 
         self.max_steps = max_steps
 
@@ -207,6 +264,18 @@ class TranslationTrainer:
             eps=1e-9,
             weight_decay=weight_decay,
         )
+
+        # Clamp warmup to keep OneCycleLR pct_start in [0, 1).
+        max_warmup_steps = max(0, max_steps - 1)
+        self.warmup_steps = min(warmup_steps, max_warmup_steps)
+        if self.warmup_steps != warmup_steps:
+            logger.warning(
+                "warmup_steps (%d) exceeds max_steps-1 (%d); clamping to %d",
+                warmup_steps,
+                max_warmup_steps,
+                self.warmup_steps,
+            )
+        pct_start = float(self.warmup_steps) / float(max_steps)
 
         # Learning rate scheduler (FIXED)
         pct_start = min(max(float(warmup_steps) / float(max_steps), 0.0), 1.0)
@@ -335,14 +404,17 @@ class TranslationTrainer:
             'global_step': self.global_step,
             'best_val_loss': self.best_val_loss,
         }
-        
-        save_path = self.save_dir / filename
+
+        checkpoint_path = Path(filename)
+        save_path = checkpoint_path if checkpoint_path.is_absolute() else self.save_dir / checkpoint_path
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, save_path)
-        print(f"✓ Checkpoint saved: {save_path}")
+        print(f"[OK] Checkpoint saved: {save_path}")
     
     def load_checkpoint(self, filename: str) -> None:
         """Load model checkpoint."""
-        load_path = self.save_dir / filename
+        checkpoint_path = Path(filename)
+        load_path = checkpoint_path if checkpoint_path.is_absolute() else self.save_dir / checkpoint_path
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
         checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
         
@@ -352,7 +424,7 @@ class TranslationTrainer:
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
         
-        print(f"✓ Checkpoint loaded: {load_path}")
+        print(f"[OK] Checkpoint loaded: {load_path}")
     
     def train(
         self,
@@ -391,7 +463,7 @@ class TranslationTrainer:
             for batch in progress_bar:
                 # Check if we've reached max_steps BEFORE taking a step
                 if self.global_step >= self.max_steps:
-                    print(f"\n✓ Reached max_steps ({self.max_steps})")
+                    print(f"\n[OK] Reached max_steps ({self.max_steps})")
                     training_complete = True
                     break
 
@@ -425,7 +497,7 @@ class TranslationTrainer:
                     self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
 
         print(f"\n{'='*80}")
-        print("✓ TRAINING COMPLETE")
+        print("[OK] TRAINING COMPLETE")
         print(f"  Final step: {self.global_step}")
         print(f"  Best validation loss: {self.best_val_loss:.4f}")
         print(f"{'='*80}")
@@ -549,7 +621,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"\nLoading validation data from {args.val_data}...")
         with open(args.val_data, 'r') as f:
             val_data = json.load(f)
-        print(f"✓ Loaded {len(val_data)} validation examples")
+        print(f"[OK] Loaded {len(val_data)} validation examples")
 
         val_dataset = TranslationDataset(val_data, tokenizer, max_length=args.max_length)
         val_loader = cast(
@@ -574,9 +646,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
         ),
     )
-    print(f"✓ Train loader: {len(train_loader)} batches")
+    print(f"[OK] Train loader: {len(train_loader)} batches")
     if val_loader:
-        print(f"✓ Val loader: {len(val_loader)} batches")
+        print(f"[OK] Val loader: {len(val_loader)} batches")
 
     # Select device
     if args.device == 'auto':
@@ -589,7 +661,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"\nCreating model (size={args.model_size})...")
     model = create_model(vocab_size=vocab_size, model_size=args.model_size)
     params = model.count_parameters()
-    print(f"✓ Model created: {params['total']/1e6:.1f}M parameters")
+    print(f"[OK] Model created: {params['total']/1e6:.1f}M parameters")
 
     # Create trainer
     print("\nInitializing trainer...")
@@ -606,7 +678,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         device=device,
         save_dir=args.save_dir,
     )
-    print("✓ Trainer ready")
+    print("[OK] Trainer ready")
 
     # Start training
     print("\n" + "=" * 80)
@@ -621,19 +693,19 @@ def main(argv: Optional[List[str]] = None) -> None:
             log_steps=args.log_steps,
         )
         print("\n" + "=" * 80)
-        print("✓ TRAINING COMPLETED SUCCESSFULLY")
+        print("[OK] TRAINING COMPLETED SUCCESSFULLY")
         print("=" * 80)
     except KeyboardInterrupt:
         print("\n\n" + "=" * 80)
-        print("⚠ TRAINING INTERRUPTED")
+        print("[WARN] TRAINING INTERRUPTED")
         print("=" * 80)
         print("Saving checkpoint...")
         trainer.save_checkpoint('interrupted.pt')
-        print("✓ Checkpoint saved")
+        print("[OK] Checkpoint saved")
         sys.exit(1)
     except Exception as e:
         print("\n\n" + "=" * 80)
-        print("✗ TRAINING FAILED")
+        print("[ERROR] TRAINING FAILED")
         print("=" * 80)
         print(f"Error: {e}")
         import traceback
