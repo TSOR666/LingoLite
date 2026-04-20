@@ -1,14 +1,14 @@
-"""CPU smoke test: verify the model can actually learn to translate.
+"""CPU smoke test for the full train-to-translate path.
 
-Creates a tiny model, overfits it on a handful of synthetic translation
-pairs, then runs greedy + cached + beam-search inference and checks that
-the generated token sequences match the training targets.  If this test
-passes the full train-to-translate pipeline is wired correctly on CPU.
+The test overfits a tiny model on synthetic translation pairs and then
+checks that greedy and cached decoding reconstruct the target exactly,
+while beam decoding still produces a valid overlapping translation on CPU.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 import pytest
@@ -19,12 +19,18 @@ from lingolite.mobile_translation_model import create_model
 from lingolite.training import TranslationDataset, TranslationTrainer, collate_fn
 
 
-# ── Dummy tokenizer (no SentencePiece required) ────────────────────────
-
 PAD, SOS, EOS, UNK = 0, 1, 2, 3
 SRC_TOK, TGT_TOK = 4, 5
 EN_TOK, ES_TOK = 6, 7
-VOCAB_SIZE = 64  # keep small for speed
+VOCAB_SIZE = 64
+TEXT_TO_BODY_TOKENS = {
+    "abc": [8, 9],
+    "hello": [10, 11],
+    "one": [12, 13],
+    "xyz": [20, 21],
+    "hola": [22, 23],
+    "uno": [24, 25],
+}
 
 
 @dataclass
@@ -44,8 +50,11 @@ class _DummyTokenizer:
         add_special_tokens: bool = True,
         max_length: int = 128,
     ) -> List[int]:
-        # Deterministic: map each char to a token id in [8, VOCAB_SIZE)
-        body = [8 + (ord(c) % (VOCAB_SIZE - 8)) for c in text][:max(1, max_length - 4)]
+        # Keep the synthetic task tiny and separable: each sentence maps to a
+        # fixed token sequence so the smoke test can check exact translation.
+        body = list(TEXT_TO_BODY_TOKENS.get(text, []))
+        if not body:
+            body = [8 + (ord(c) % (VOCAB_SIZE - 8)) for c in text][: max(1, max_length - 4)]
         if add_special_tokens and src_lang and tgt_lang:
             return [
                 self.token_to_id["<src>"],
@@ -64,14 +73,17 @@ def _make_tokenizer() -> _DummyTokenizer:
     return _DummyTokenizer(
         languages=["en", "es"],
         token_to_id={
-            "<pad>": PAD, "<s>": SOS, "</s>": EOS, "<unk>": UNK,
-            "<src>": SRC_TOK, "<tgt>": TGT_TOK,
-            "<en>": EN_TOK, "<es>": ES_TOK,
+            "<pad>": PAD,
+            "<s>": SOS,
+            "</s>": EOS,
+            "<unk>": UNK,
+            "<src>": SRC_TOK,
+            "<tgt>": TGT_TOK,
+            "<en>": EN_TOK,
+            "<es>": ES_TOK,
         },
     )
 
-
-# ── Training pairs ─────────────────────────────────────────────────────
 
 PAIRS = [
     {"src_text": "abc", "tgt_text": "xyz", "src_lang": "en", "tgt_lang": "es"},
@@ -80,49 +92,46 @@ PAIRS = [
 ]
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+def _decode_without_special(tokens: torch.Tensor) -> List[int]:
+    """Strip all control / language / framing tokens from a 1-D tensor."""
+    special_ids = {PAD, SOS, EOS, UNK, SRC_TOK, TGT_TOK, EN_TOK, ES_TOK}
+    return [t for t in tokens.tolist() if t not in special_ids]
+
 
 def _train_until_overfit(
     model: torch.nn.Module,
     loader: DataLoader,
+    save_dir: str,
     max_epochs: int = 80,
     target_loss: float = 0.05,
-) -> float:
-    """Train with a raw optimiser loop (avoids OneCycleLR step-limit issues)."""
-    optimiser = torch.optim.Adam(model.parameters(), lr=3e-3)
-    model.train()
+) -> tuple[TranslationTrainer, float]:
+    """Train through the real trainer so the smoke test covers that path."""
+    trainer = TranslationTrainer(
+        model=model,
+        train_loader=loader,
+        learning_rate=3e-3,
+        warmup_steps=8,
+        max_steps=96,
+        gradient_clip=1.0,
+        label_smoothing=0.0,
+        device="cpu",
+        save_dir=save_dir,
+    )
     last_loss = float("inf")
     for _epoch in range(max_epochs):
         for batch in loader:
-            loss: torch.Tensor = model.compute_loss(
-                src_input_ids=batch["src_input_ids"],
-                tgt_input_ids=batch["tgt_input_ids"],
-                src_attention_mask=batch["src_attention_mask"],
-                tgt_attention_mask=batch["tgt_attention_mask"],
-                label_smoothing=0.0,
-            )
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
-            last_loss = loss.item()
-        if last_loss < target_loss:
+            if trainer.global_step >= trainer.max_steps:
+                break
+            loss, _metrics = trainer.train_step(batch)
+            last_loss = loss
+        if last_loss < target_loss or trainer.global_step >= trainer.max_steps:
             break
-    return last_loss
+    return trainer, last_loss
 
-
-SPECIAL_IDS = {PAD, SOS, EOS, UNK, SRC_TOK, TGT_TOK, EN_TOK, ES_TOK}
-
-
-def _decode_without_special(tokens: torch.Tensor) -> List[int]:
-    """Strip all control / language / framing tokens from a 1-D tensor."""
-    return [t for t in tokens.tolist() if t not in SPECIAL_IDS]
-
-
-# ── Test ────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="module")
 def trained_model_and_loader():
-    """Train a tiny model once and share across all tests in this module."""
+    """Train a tiny model once and share it across all tests in this module."""
     torch.manual_seed(42)
 
     tokenizer = _make_tokenizer()
@@ -146,26 +155,42 @@ def trained_model_and_loader():
         pad_token_id=PAD,
     )
 
-    final_loss = _train_until_overfit(model, loader)
+    trainer, final_loss = _train_until_overfit(
+        model,
+        loader,
+        save_dir=str(Path(".tmp_manual") / "smoke_translate"),
+    )
 
-    return model, loader, tokenizer, final_loss
+    return model, loader, tokenizer, trainer, final_loss
+
+
+def _assert_translation_matches(
+    *,
+    translated: torch.Tensor,
+    expected: torch.Tensor,
+    pair: Dict[str, str],
+    mode: str,
+) -> None:
+    expected_body = _decode_without_special(expected)
+    translated_body = _decode_without_special(translated)
+    assert translated_body == expected_body, (
+        f"{mode} translation mismatch for {pair['src_text']} -> {pair['tgt_text']}: "
+        f"expected {expected_body}, got {translated_body}"
+    )
 
 
 class TestSmokeTranslate:
     """End-to-end CPU translation smoke tests."""
 
-    # -- prerequisite: training converged --
-
     def test_training_converged(self, trained_model_and_loader):
-        _, _, _, final_loss = trained_model_and_loader
+        _, _, _, trainer, final_loss = trained_model_and_loader
+        assert trainer.global_step > 0
         assert final_loss < 0.15, (
             f"Model did not converge: final loss {final_loss:.4f} (expected < 0.15)"
         )
 
-    # -- greedy decoding reproduces training targets --
-
     def test_greedy_reproduces_targets(self, trained_model_and_loader):
-        model, loader, tokenizer, _ = trained_model_and_loader
+        model, loader, _, _, _ = trained_model_and_loader
         model.eval()
         batch = next(iter(loader))
 
@@ -178,19 +203,16 @@ class TestSmokeTranslate:
                 eos_token_id=EOS,
             )
 
-        # For each pair, the generated body tokens should match the target body
         for i, pair in enumerate(PAIRS):
-            tgt_body = _decode_without_special(batch["tgt_input_ids"][i])
-            gen_body = _decode_without_special(generated[i])
-            assert gen_body == tgt_body, (
-                f"Pair {i} ({pair['src_text']}→{pair['tgt_text']}): "
-                f"expected {tgt_body}, got {gen_body}"
+            _assert_translation_matches(
+                translated=generated[i],
+                expected=batch["tgt_input_ids"][i],
+                pair=pair,
+                mode="greedy",
             )
 
-    # -- cached generation produces valid output matching targets --
-
-    def test_cached_produces_valid_output(self, trained_model_and_loader):
-        model, loader, _, _ = trained_model_and_loader
+    def test_cached_reproduces_targets(self, trained_model_and_loader):
+        model, loader, _, _, _ = trained_model_and_loader
         model.eval()
         batch = next(iter(loader))
 
@@ -204,23 +226,16 @@ class TestSmokeTranslate:
                 temperature=1.0,
             )
 
-        assert cached.ndim == 2
-        assert cached.shape[0] == len(PAIRS)
-        # Cached output should contain the target content tokens
         for i, pair in enumerate(PAIRS):
-            tgt_body = _decode_without_special(batch["tgt_input_ids"][i])
-            gen_body = _decode_without_special(cached[i])
-            # All target tokens should appear in the generated output
-            missing = [t for t in tgt_body if t not in gen_body]
-            assert len(missing) == 0, (
-                f"Pair {i} ({pair['src_text']}→{pair['tgt_text']}): "
-                f"cached output missing target tokens {missing}"
+            _assert_translation_matches(
+                translated=cached[i],
+                expected=batch["tgt_input_ids"][i],
+                pair=pair,
+                mode="cached",
             )
 
-    # -- beam search produces valid output --
-
-    def test_beam_search_valid(self, trained_model_and_loader):
-        model, loader, _, _ = trained_model_and_loader
+    def test_beam_search_smoke(self, trained_model_and_loader):
+        model, loader, _, _, _ = trained_model_and_loader
         model.eval()
         batch = next(iter(loader))
 
@@ -236,20 +251,23 @@ class TestSmokeTranslate:
 
         assert beam.ndim == 2
         assert beam.shape[0] == len(PAIRS)
-        # Beam output should contain at least some of the target tokens
+        assert beam.dtype == torch.long
+        assert beam.shape[1] <= 24
+
         for i, pair in enumerate(PAIRS):
-            tgt_body = set(_decode_without_special(batch["tgt_input_ids"][i]))
-            gen_body = set(_decode_without_special(beam[i]))
-            overlap = tgt_body & gen_body
-            assert len(overlap) > 0, (
-                f"Pair {i} ({pair['src_text']}→{pair['tgt_text']}): "
-                f"beam search output shares no tokens with target"
+            expected_body = set(_decode_without_special(batch["tgt_input_ids"][i]))
+            translated_body = set(_decode_without_special(beam[i]))
+            assert translated_body, (
+                f"beam search produced an empty translation for "
+                f"{pair['src_text']} -> {pair['tgt_text']}"
+            )
+            assert expected_body & translated_body, (
+                f"beam search output shares no tokens with the target for "
+                f"{pair['src_text']} -> {pair['tgt_text']}"
             )
 
-    # -- output shapes and dtypes are correct --
-
     def test_output_shape_and_dtype(self, trained_model_and_loader):
-        model, loader, _, _ = trained_model_and_loader
+        model, loader, _, _, _ = trained_model_and_loader
         model.eval()
         batch = next(iter(loader))
 
@@ -266,10 +284,8 @@ class TestSmokeTranslate:
         assert generated.shape[0] == len(PAIRS)
         assert generated.shape[1] <= 24
 
-    # -- no NaN / Inf in logits --
-
     def test_no_nan_in_forward(self, trained_model_and_loader):
-        model, loader, _, _ = trained_model_and_loader
+        model, loader, _, _, _ = trained_model_and_loader
         model.eval()
         batch = next(iter(loader))
 
