@@ -62,6 +62,26 @@ def test_generate_is_deterministic_by_default() -> None:
     assert torch.equal(out1, out2)
 
 
+def test_generate_accepts_temperature_above_one() -> None:
+    model = create_model(vocab_size=100, model_size="tiny")
+    model.eval()
+
+    src_input_ids = torch.randint(0, 100, (1, 8))
+    src_attention_mask = torch.ones(1, 8)
+
+    with torch.no_grad():
+        out = model.generate(
+            src_input_ids=src_input_ids,
+            src_attention_mask=src_attention_mask,
+            max_length=8,
+            sos_token_id=1,
+            eos_token_id=2,
+            temperature=1.5,
+        )
+
+    assert out.shape[0] == 1
+
+
 def test_generate_num_beams_uses_beam_path() -> None:
     model = create_model(vocab_size=100, model_size="tiny")
     src_input_ids = torch.randint(0, 100, (1, 6))

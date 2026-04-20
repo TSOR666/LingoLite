@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .utils import logger
+from .utils import InputValidator, logger
 
 if TYPE_CHECKING:
     from .mobile_translation_model import MobileTranslationModel
@@ -301,10 +301,13 @@ class BeamSearchScorer:
             # Check if this batch is done
             finished_count = len(self.finished_hypotheses[batch_idx])
 
-            # Mark batch done as soon as we have num_beams finished hypotheses,
-            # regardless of early_stopping flag. This prevents endless decoding
-            # when a sufficient number of hypotheses are complete.
-            if finished_count >= num_beams:
+            # Respect early_stopping while still terminating when all beams are done.
+            if self.early_stopping:
+                done_now = finished_count >= num_beams
+            else:
+                done_now = bool(self.beam_is_finished[batch_idx].all().item())
+
+            if done_now:
                 self.done[batch_idx] = True
 
         return input_ids, next_scores, self.done
@@ -399,6 +402,7 @@ def generate_with_kv_cache(
     Returns:
         Generated sequences (batch, gen_len)
     """
+    InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
     model.eval()
     device = src_input_ids.device
     batch_size = src_input_ids.shape[0]
@@ -408,6 +412,7 @@ def generate_with_kv_cache(
     if not 0.0 < top_p <= 1.0:
         raise ValueError("top_p must be within (0, 1].")
 
+    InputValidator.validate_positive_float(temperature, "temperature", min_value=1e-8)
     temperature = max(0.01, float(temperature))
 
     logger.info(
@@ -524,6 +529,8 @@ def generate_with_beam_search(
     Returns:
         Best sequences (batch, max_length)
     """
+    InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
+    InputValidator.validate_positive_int(num_beams, "num_beams", min_value=1)
     model.eval()
     device = src_input_ids.device
     batch_size = src_input_ids.shape[0]
