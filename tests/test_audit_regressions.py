@@ -15,6 +15,7 @@ These tests exercise the following fixes:
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -245,6 +246,34 @@ def test_beam_search_uses_incremental_kv_cache() -> None:
     assert model.decoder_input_lengths
     assert all(length == 1 for length in model.decoder_input_lengths)
     assert model.saw_past_key_values
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_beam_search_reorders_cpu_src_mask_when_inputs_on_cuda() -> None:
+    """Reindexing src masks during beam search must not fail on CPU/GPU mismatch."""
+    model = _CachingScriptedModel(
+        vocab_size=8,
+        step_logits=[
+            {3: 0.0, 4: -0.2},
+            {2: 0.0},
+            {2: 0.0},
+        ],
+    ).cuda()
+    src = torch.zeros(1, 4, dtype=torch.long, device="cuda")
+    src_mask = torch.ones(1, 4, dtype=torch.float32, device="cpu")
+
+    out = generate_with_beam_search(
+        model=model,
+        src_input_ids=src,
+        src_attention_mask=src_mask,
+        max_length=5,
+        num_beams=2,
+        sos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+
+    assert out.device.type == "cuda"
 
 
 # ---------------------------------------------------------------------------

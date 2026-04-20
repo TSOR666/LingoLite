@@ -740,6 +740,8 @@ def generate_with_beam_search(
             )
             encoder_output = encoder_output.index_select(0, beam_idx_tensor)
             if src_attention_mask is not None:
+                if src_attention_mask.device != beam_idx_tensor.device:
+                    src_attention_mask = src_attention_mask.to(beam_idx_tensor.device)
                 src_attention_mask = src_attention_mask.index_select(0, beam_idx_tensor)
             past_key_values = _reorder_past_key_values(past_key_values, beam_idx_tensor)
 
