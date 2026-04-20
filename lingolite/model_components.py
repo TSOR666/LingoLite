@@ -290,31 +290,11 @@ class GroupedQueryAttention(nn.Module):
             V = V.to(dtype=Q.dtype)
 
         present = (K, V) if use_cache else None
-
-        # Repeat K and V to match the number of query heads
-        if self.n_rep > 1:
-            K_for_scores = K.repeat_interleave(self.n_rep, dim=1)  # (B, n_kv_heads, kv_len, head_dim) -> (B, n_heads, kv_len, head_dim)
-            V_for_scores = V.repeat_interleave(self.n_rep, dim=1)  # (B, n_kv_heads, kv_len, head_dim) -> (B, n_heads, kv_len, head_dim)
-        else:
-            K_for_scores = K
-            V_for_scores = V
-
-        kv_len = K_for_scores.shape[2]
-
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K_for_scores.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, n_heads, q_len, head_dim) @ (B, n_heads, head_dim, kv_len) -> (B, n_heads, q_len, kv_len)
-
-        if self.is_causal:
-            kv_positions = torch.arange(kv_len, device=scores.device)
-            query_positions = torch.arange(q_len, device=scores.device)
-            if past_key is not None and kv_len >= q_len:
-                query_positions = query_positions + (kv_len - q_len)
-            causal_mask = kv_positions.unsqueeze(0) > query_positions.unsqueeze(-1)
-            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        kv_len = K.shape[2]
 
         valid_mask: Optional[torch.Tensor] = None
         if attention_mask is not None:
-            # Support masks shaped (B, kv_len), (B, q_len, kv_len), or (B, 1, q_len, kv_len)
+            # Support masks shaped (B, kv_len), (B, q_len, kv_len), or (B, 1, q_len, kv_len).
             if attention_mask.dim() == 2:
                 attention_mask = attention_mask[:, None, None, :]
             elif attention_mask.dim() == 3:
@@ -323,34 +303,90 @@ class GroupedQueryAttention(nn.Module):
                 raise ValueError(
                     f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
                 )
-            attention_mask = attention_mask.to(device=scores.device)
-            # Binary-mask semantics only: nonzero (or True) = valid token, zero = padding.
-            # Avoid the prior `.min().item()` sync, which forced a CPU-GPU barrier in every
-            # attention call and was especially costly during autoregressive decoding.
+            attention_mask = attention_mask.to(device=Q.device)
             if attention_mask.dtype == torch.bool:
                 valid_mask = attention_mask
             else:
-                valid_mask = attention_mask != 0
-            if valid_mask.shape != scores.shape:
-                valid_mask = valid_mask.expand_as(scores)
-            scores = scores.masked_fill(~valid_mask, float('-inf'))
+                # Support both binary masks (1=keep, 0=mask) and common additive masks
+                # (0=keep, negative=mask) without synchronizing back to Python.
+                binary_valid_mask = attention_mask != 0
+                additive_valid_mask = attention_mask >= 0
+                has_negative_values = (attention_mask < 0).any()
+                valid_mask = torch.where(
+                    has_negative_values,
+                    additive_valid_mask,
+                    binary_valid_mask,
+                )
 
-        # Handle fully masked rows explicitly to avoid uniform attention on padding
+        if self.is_causal:
+            kv_positions = torch.arange(kv_len, device=Q.device)
+            query_positions = torch.arange(q_len, device=Q.device)
+            if past_key is not None and kv_len >= q_len:
+                query_positions = query_positions + (kv_len - q_len)
+            causal_valid_mask = kv_positions.unsqueeze(0) <= query_positions.unsqueeze(-1)
+            causal_valid_mask = causal_valid_mask.unsqueeze(0).unsqueeze(0)
+            valid_mask = (
+                causal_valid_mask
+                if valid_mask is None
+                else valid_mask & causal_valid_mask
+            )
+
         fully_masked = None
         if valid_mask is not None:
-            fully_masked = ~valid_mask.any(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
-        if fully_masked is not None and fully_masked.any():
-            # Zero-out masked rows before softmax to keep output neutral
-            scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
-        scores_for_softmax = scores.float()  # (B, n_heads, q_len, kv_len)
-        attn = F.softmax(scores_for_softmax, dim=-1)
-        if attn.dtype != scores.dtype:
-            attn = attn.to(dtype=scores.dtype)
-        if fully_masked is not None and fully_masked.any():
-            attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
-        attn = self.dropout(attn)
+            fully_masked = ~valid_mask.any(dim=-1, keepdim=True)
 
-        output = torch.matmul(attn, V_for_scores)  # (B, n_heads, q_len, kv_len) @ (B, n_heads, kv_len, head_dim) -> (B, n_heads, q_len, head_dim)
+        dropout_p = self.dropout.p if self.training else 0.0
+        can_use_sdpa = hasattr(F, "scaled_dot_product_attention")
+        if fully_masked is not None and bool(fully_masked.any().item()):
+            can_use_sdpa = False
+
+        if can_use_sdpa:
+            try:
+                output = F.scaled_dot_product_attention(
+                    Q,
+                    K,
+                    V,
+                    attn_mask=valid_mask,
+                    dropout_p=dropout_p,
+                    enable_gqa=self.n_rep > 1,
+                )
+            except TypeError:
+                K_for_scores = K.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else K
+                V_for_scores = V.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else V
+                output = F.scaled_dot_product_attention(
+                    Q,
+                    K_for_scores,
+                    V_for_scores,
+                    attn_mask=valid_mask,
+                    dropout_p=dropout_p,
+                )
+        else:
+            if self.n_rep > 1:
+                K_for_scores = K.repeat_interleave(self.n_rep, dim=1)
+                V_for_scores = V.repeat_interleave(self.n_rep, dim=1)
+            else:
+                K_for_scores = K
+                V_for_scores = V
+
+            scores = torch.matmul(Q, K_for_scores.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            if valid_mask is not None:
+                mask_for_scores = valid_mask
+                if mask_for_scores.shape != scores.shape:
+                    mask_for_scores = mask_for_scores.expand_as(scores)
+                scores = scores.masked_fill(~mask_for_scores, float('-inf'))
+
+            if fully_masked is not None and bool(fully_masked.any().item()):
+                scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
+
+            attn = F.softmax(scores.float(), dim=-1).to(dtype=scores.dtype)
+            if fully_masked is not None and bool(fully_masked.any().item()):
+                attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
+            if dropout_p > 0.0:
+                attn = F.dropout(attn, p=dropout_p, training=True)
+
+            output = torch.matmul(attn, V_for_scores)
+
         output = output.transpose(1, 2).contiguous().view(batch, q_len, -1)  # (B, n_heads, q_len, head_dim) -> (B, q_len, n_heads * head_dim)
         output = self.o_proj(output)
 

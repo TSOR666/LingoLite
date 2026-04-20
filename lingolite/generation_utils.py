@@ -107,6 +107,14 @@ class KVCache:
         if self.value is not None:
             self.value = self.value.to(device=device, dtype=dtype)
         return self
+
+    def reorder(self, beam_indices: torch.Tensor) -> 'KVCache':
+        """Reorder cached batch entries after beam selection."""
+        if self.key is None or self.value is None:
+            return self
+        self.key = self.key.index_select(0, beam_indices.to(device=self.key.device))
+        self.value = self.value.index_select(0, beam_indices.to(device=self.value.device))
+        return self
     
     def get_seq_len(self) -> int:
         """Get current sequence length in cache."""
@@ -126,6 +134,21 @@ class LayerKVCache:
         self.self_attn_cache.to(device, dtype=dtype)
         self.cross_attn_cache.to(device, dtype=dtype)
         return self
+
+    def reorder(self, beam_indices: torch.Tensor) -> 'LayerKVCache':
+        self.self_attn_cache.reorder(beam_indices)
+        self.cross_attn_cache.reorder(beam_indices)
+        return self
+
+
+def _reorder_past_key_values(
+    past_key_values: Optional[List[LayerKVCache]],
+    beam_indices: torch.Tensor,
+) -> Optional[List[LayerKVCache]]:
+    """Reorder decoder caches to match the new beam ordering."""
+    if past_key_values is None:
+        return None
+    return [layer_cache.reorder(beam_indices) for layer_cache in past_key_values]
 
 
 def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -443,7 +466,7 @@ def generate_with_kv_cache(
 
         for step in range(max_length - 1):
             decoder_input = generated[:, -1:]
-            tgt_mask = torch.ones_like(decoder_input, dtype=torch.float, device=device)
+            tgt_mask = torch.ones_like(decoder_input, dtype=torch.bool, device=device)
 
             decoder_outputs = model.decoder(
                 input_ids=decoder_input,
@@ -588,18 +611,23 @@ def generate_with_beam_search(
         beam_scores = torch.full((batch_size * num_beams,), float('-inf'), device=device)
         # Activate first beam of each batch (indices 0, num_beams, 2*num_beams, ...)
         beam_scores[::num_beams] = 0.0
+        past_key_values: Optional[List[LayerKVCache]] = None
         
         # Generate
         for step in range(max_length - 1):
-            # Forward pass
-            tgt_mask = torch.ones_like(input_ids, dtype=torch.float)
+            decoder_input = input_ids[:, -1:]
+            tgt_mask = torch.ones_like(decoder_input, dtype=torch.bool, device=device)
 
-            logits, _ = model.decoder(
-                input_ids=input_ids,
+            logits, updated_past_key_values = model.decoder(
+                input_ids=decoder_input,
                 encoder_output=encoder_output,
                 self_attention_mask=tgt_mask,
                 cross_attention_mask=src_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
+            if updated_past_key_values is not None:
+                past_key_values = updated_past_key_values
 
             # Get next token logits
             next_token_logits = logits[:, -1, :]  # (batch * num_beams, vocab_size)
@@ -699,19 +727,21 @@ def generate_with_beam_search(
                         beam_scorer.done[batch_idx] = True
 
             # Create new input_ids using the selected live beams.
-            input_ids = torch.cat(
-                [
-                    input_ids[new_beam_idx_global],
-                    torch.tensor(
-                        new_beam_next_tokens, device=device, dtype=torch.long
-                    ).unsqueeze(1),
-                ],
-                dim=1,
+            beam_idx_tensor = torch.tensor(
+                new_beam_idx_global, device=device, dtype=torch.long
             )
+            next_token_tensor = torch.tensor(
+                new_beam_next_tokens, device=device, dtype=torch.long
+            ).unsqueeze(1)
+            input_ids = torch.cat([input_ids[beam_idx_tensor], next_token_tensor], dim=1)
 
             beam_scores = torch.tensor(
                 new_beam_scores, device=device, dtype=torch.float32
             )
+            encoder_output = encoder_output.index_select(0, beam_idx_tensor)
+            if src_attention_mask is not None:
+                src_attention_mask = src_attention_mask.index_select(0, beam_idx_tensor)
+            past_key_values = _reorder_past_key_values(past_key_values, beam_idx_tensor)
 
             # Early stopping
             if beam_scorer.done.all().item():

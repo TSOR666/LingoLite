@@ -11,8 +11,20 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
-import torch.ao.quantization as quant
-from torch.ao.quantization import DeQuantStub, QuantStub
+import torch.nn.functional as F
+
+try:
+    from torchao.quantization import (
+        Int8DynamicActivationInt8WeightConfig,
+        quantize_,
+    )
+    TORCHAO_AVAILABLE = True
+    TORCHAO_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - exercised via runtime envs
+    Int8DynamicActivationInt8WeightConfig = None
+    quantize_ = None
+    TORCHAO_AVAILABLE = False
+    TORCHAO_IMPORT_ERROR = exc
 
 from .mobile_translation_model import MobileTranslationModel
 from .utils import logger
@@ -24,18 +36,12 @@ QAT_SUPPORTED = False
 
 class QuantizableModel(nn.Module):
     """
-    Wrapper to make MobileTranslationModel quantizable.
-    Adds QuantStub and DeQuantStub for quantization.
+    Wrapper that keeps the quantization API surface stable.
     """
 
     def __init__(self, model: MobileTranslationModel):
         super().__init__()
         self.model = model
-
-        # Quantization stubs
-        self.quant_src = QuantStub()
-        self.quant_tgt = QuantStub()
-        self.dequant = DeQuantStub()
 
     def forward(
         self,
@@ -63,6 +69,57 @@ class QuantizableModel(nn.Module):
         return self.model.generate(*args, **kwargs)
 
 
+class DynamicQuantizedLinear(nn.Module):
+    """
+    Lightweight eager-mode INT8 linear fallback used when ``torchao`` is absent.
+
+    It stores quantized weights compactly in the state dict and dequantizes on
+    the fly for matmul, preserving correctness while keeping this module free of
+    deprecated ``torch.ao.quantization`` APIs.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.register_buffer("weight_q", torch.empty(0, dtype=torch.int8))
+        self.register_buffer("weight_scale", torch.empty(0, dtype=torch.float32))
+        bias = None if linear.bias is None else linear.bias.detach().clone()
+        self.register_buffer("bias", bias)
+        self._pack_weight(linear.weight.detach())
+
+    def _pack_weight(self, weight: torch.Tensor) -> None:
+        weight_fp32 = weight.to(dtype=torch.float32)
+        scale = weight_fp32.abs().amax(dim=1, keepdim=True)
+        scale = torch.clamp(scale / 127.0, min=1e-8)
+        quantized = torch.round(weight_fp32 / scale).clamp(-128, 127).to(torch.int8)
+        self.weight_q = quantized.contiguous()
+        self.weight_scale = scale.contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight_q.to(device=x.device, dtype=x.dtype)
+        scale = self.weight_scale.to(device=x.device, dtype=x.dtype)
+        bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, weight * scale, bias)
+
+
+def _replace_linear_modules(module: nn.Module, replacement_fn: Any) -> None:
+    """Recursively replace ``nn.Linear`` modules in-place."""
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, replacement_fn(child))
+        else:
+            _replace_linear_modules(child, replacement_fn)
+
+
+def _apply_torchao_dynamic_quantization(model: MobileTranslationModel) -> bool:
+    """Apply the preferred torchao eager-mode INT8 path if available."""
+    if not TORCHAO_AVAILABLE or quantize_ is None or Int8DynamicActivationInt8WeightConfig is None:
+        return False
+    quantize_(model, Int8DynamicActivationInt8WeightConfig())
+    return True
+
+
 def prepare_model_for_qat(
     model: MobileTranslationModel,
     qconfig: str = 'fbgemm',
@@ -77,34 +134,10 @@ def prepare_model_for_qat(
     Returns:
         Model prepared for QAT
     """
-    if not QAT_SUPPORTED:
-        raise RuntimeError(
-            "Quantization-aware training is not supported for this model layout. "
-            "Use dynamic quantization via apply_dynamic_quantization instead."
-        )
-    logger.info(f"Preparing model for QAT with qconfig: {qconfig}")
-
-    # Wrap model
-    quantizable_model = QuantizableModel(model)
-
-    # Set to training mode for QAT
-    quantizable_model.train()
-
-    # Configure quantization
-    if qconfig == 'fbgemm':
-        qconfig_spec = quant.get_default_qat_qconfig('fbgemm')  # type: ignore[no-untyped-call]
-    elif qconfig == 'qnnpack':
-        qconfig_spec = quant.get_default_qat_qconfig('qnnpack')  # type: ignore[no-untyped-call]
-    else:
-        raise ValueError(f"Unknown qconfig: {qconfig}")
-
-    quantizable_model.qconfig = qconfig_spec
-
-    # Prepare for QAT
-    quant.prepare_qat(quantizable_model, inplace=True)  # type: ignore[no-untyped-call]
-
-    logger.info("Model prepared for QAT")
-    return quantizable_model
+    raise RuntimeError(
+        "Quantization-aware training is not supported for this model layout. "
+        "Use dynamic quantization via apply_dynamic_quantization instead."
+    )
 
 
 def convert_qat_model(
@@ -119,20 +152,9 @@ def convert_qat_model(
     Returns:
         Quantized model for inference
     """
-    if not QAT_SUPPORTED:
-        raise RuntimeError(
-            "convert_qat_model called but QAT is not supported; run apply_dynamic_quantization instead."
-        )
-    logger.info("Converting QAT model to quantized model...")
-
-    # Set to eval mode
-    qat_model.eval()
-
-    # Convert to quantized model
-    quantized_model = quant.convert(qat_model, inplace=False)  # type: ignore[no-untyped-call]
-
-    logger.info("QAT model converted to quantized model")
-    return cast(QuantizableModel, quantized_model)
+    raise RuntimeError(
+        "convert_qat_model called but QAT is not supported; run apply_dynamic_quantization instead."
+    )
 
 
 def apply_dynamic_quantization(
@@ -156,19 +178,35 @@ def apply_dynamic_quantization(
     """
     logger.info(f"Applying dynamic quantization with dtype: {dtype}")
 
-    # Copy model to avoid modifying original
     quantized_model = copy.deepcopy(model)
     quantized_model.eval()
 
-    # Apply dynamic quantization to Linear layers
-    quantized_model = quant.quantize_dynamic(  # type: ignore[no-untyped-call]
-        quantized_model,
-        qconfig_spec={nn.Linear},  # Quantize all Linear layers
-        dtype=dtype,
-    )
+    if dtype == torch.qint8:
+        if _apply_torchao_dynamic_quantization(quantized_model):
+            logger.info("Dynamic quantization applied with torchao eager mode")
+            return cast(MobileTranslationModel, quantized_model)
 
-    logger.info("Dynamic quantization applied")
-    return cast(MobileTranslationModel, quantized_model)
+        logger.warning(
+            "torchao is not available (%s); using the built-in eager INT8 compatibility "
+            "fallback until torchao is installed.",
+            TORCHAO_IMPORT_ERROR,
+        )
+        _replace_linear_modules(
+            quantized_model,
+            replacement_fn=lambda linear: DynamicQuantizedLinear(linear),
+        )
+        logger.info("Dynamic quantization applied with eager INT8 compatibility fallback")
+        return cast(MobileTranslationModel, quantized_model)
+
+    if dtype == torch.float16:
+        quantized_model = quantized_model.to(dtype=torch.float16)
+        logger.info("Applied float16 reduced-precision fallback")
+        return cast(MobileTranslationModel, quantized_model)
+
+    raise ValueError(
+        f"Unsupported dynamic quantization dtype: {dtype}. "
+        "Expected torch.qint8 or torch.float16."
+    )
 
 
 def apply_static_quantization(
@@ -188,55 +226,10 @@ def apply_static_quantization(
     Returns:
         Statically quantized model
     """
-    if not STATIC_QUANTIZATION_SUPPORTED:
-        raise RuntimeError(
-            "Static quantization is not supported for this transformer model. "
-            "Use apply_dynamic_quantization for supported linear layers."
-        )
-    logger.info(f"Applying static quantization with qconfig: {qconfig}")
-
-    # Wrap model
-    quantizable_model = QuantizableModel(model)
-    quantizable_model.eval()
-
-    # Set quantization config
-    if qconfig == 'fbgemm':
-        backend = 'fbgemm'
-        qconfig_spec = quant.get_default_qconfig('fbgemm')  # type: ignore[no-untyped-call]
-    elif qconfig == 'qnnpack':
-        backend = 'qnnpack'
-        qconfig_spec = quant.get_default_qconfig('qnnpack')  # type: ignore[no-untyped-call]
-    else:
-        raise ValueError(f"Unknown qconfig: {qconfig}")
-
-    torch.backends.quantized.engine = backend
-    quantizable_model.qconfig = qconfig_spec
-
-    # Prepare for static quantization
-    quant.prepare(quantizable_model, inplace=True)  # type: ignore[no-untyped-call]
-
-    # Calibrate with representative data
-    logger.info("Calibrating quantization parameters...")
-    with torch.no_grad():
-        for i, batch in enumerate(calibration_data_loader):
-            if i >= 100:  # Limit calibration samples
-                break
-
-            src_ids = batch['src_input_ids']
-            tgt_ids = batch['tgt_input_ids']
-            src_mask = batch.get('src_attention_mask')
-            tgt_mask = batch.get('tgt_attention_mask')
-
-            quantizable_model(src_ids, tgt_ids, src_mask, tgt_mask)
-
-            if (i + 1) % 10 == 0:
-                logger.info(f"Calibrated {i + 1} batches")
-
-    # Convert to quantized model
-    quantized_model = quant.convert(quantizable_model, inplace=False)  # type: ignore[no-untyped-call]
-
-    logger.info("Static quantization applied")
-    return cast(QuantizableModel, quantized_model)
+    raise RuntimeError(
+        "Static quantization is not supported for this transformer model. "
+        "Use apply_dynamic_quantization for supported linear layers."
+    )
 
 
 def measure_model_size(model: nn.Module) -> Dict[str, float]:

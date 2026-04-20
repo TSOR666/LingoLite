@@ -18,6 +18,9 @@ pydantic>=2.0.0
 # Optional: For mixed precision training (recommended)
 # No additional packages needed - uses torch.cuda.amp
 
+# Optional: For eager-mode dynamic quantization without deprecated torch.ao APIs
+# torchao>=0.17.0
+
 # Optional: For exporting to mobile
 # onnx>=1.14.1
 # onnxruntime>=1.16.0
