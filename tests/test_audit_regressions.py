@@ -15,6 +15,7 @@ These tests exercise the following fixes:
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -50,6 +51,8 @@ class _ScriptedModel(torch.nn.Module):
         self.pad_token_id = 0
         self._step_logits = step_logits
         self._step_counter = {"idx": 0}
+        self.encoder_attention_mask_devices: list[torch.device] = []
+        self.decoder_cross_attention_mask_devices: list[torch.device] = []
 
         encoder_module = torch.nn.Module()
         encoder_module.embedding = torch.nn.Embedding(vocab_size, 8)
@@ -69,7 +72,12 @@ class _ScriptedModel(torch.nn.Module):
     # and ``model.decoder(input_ids=..., ...)`` — we stub both.
     def encoder(self, input_ids, attention_mask=None):
         batch, src_len = input_ids.shape
-        return torch.zeros(batch, src_len, 8)
+        if attention_mask is not None:
+            self.encoder_attention_mask_devices.append(attention_mask.device)
+        return self.encoder_module.embedding.weight.new_zeros(
+            (batch, src_len, 8),
+            device=input_ids.device,
+        )
 
     def decoder(
         self,
@@ -83,8 +91,13 @@ class _ScriptedModel(torch.nn.Module):
         idx = self._step_counter["idx"]
         self._step_counter["idx"] = idx + 1
         batch, tgt_len = input_ids.shape
+        if cross_attention_mask is not None:
+            self.decoder_cross_attention_mask_devices.append(cross_attention_mask.device)
         logits = torch.full(
-            (batch, tgt_len, self.vocab_size), -1e9, dtype=torch.float32
+            (batch, tgt_len, self.vocab_size),
+            -1e9,
+            dtype=torch.float32,
+            device=input_ids.device,
         )
         # Set the scripted logits on the last position — that is what beam
         # search reads.
@@ -128,16 +141,17 @@ class _CachingScriptedModel(_ScriptedModel):
             return logits, None
 
         batch = input_ids.shape[0]
+        cache_tensor = encoder_output.new_zeros((batch, 1, 1, 1))
         cache = LayerKVCache()
         cache.self_attn_cache = KVCache(
-            key=torch.zeros(batch, 1, 1, 1),
-            value=torch.zeros(batch, 1, 1, 1),
+            key=cache_tensor.clone(),
+            value=cache_tensor.clone(),
             num_heads=1,
             head_dim=1,
         )
         cache.cross_attn_cache = KVCache(
-            key=torch.zeros(batch, 1, 1, 1),
-            value=torch.zeros(batch, 1, 1, 1),
+            key=cache_tensor.clone(),
+            value=cache_tensor.clone(),
             num_heads=1,
             head_dim=1,
         )
@@ -245,6 +259,49 @@ def test_beam_search_uses_incremental_kv_cache() -> None:
     assert model.decoder_input_lengths
     assert all(length == 1 for length in model.decoder_input_lengths)
     assert model.saw_past_key_values
+
+
+@pytest.mark.parametrize(
+    "device_str",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"),
+        ),
+    ],
+)
+def test_beam_search_threads_src_attention_mask_on_active_device(device_str: str) -> None:
+    """Beam-search regression stub should follow the caller's device."""
+
+    device = torch.device(device_str)
+    model = _CachingScriptedModel(
+        vocab_size=8,
+        step_logits=[
+            {3: 0.0, 4: -0.2},
+            {2: 0.0},
+            {2: 0.0},
+        ],
+    ).to(device)
+
+    src = torch.zeros(1, 4, dtype=torch.long, device=device)
+    src_attention_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]], device=device)
+
+    out = generate_with_beam_search(
+        model=model,
+        src_input_ids=src,
+        src_attention_mask=src_attention_mask,
+        max_length=5,
+        num_beams=2,
+        sos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+
+    assert out.device == device
+    assert model.encoder_attention_mask_devices == [device]
+    assert model.decoder_cross_attention_mask_devices
+    assert all(mask_device == device for mask_device in model.decoder_cross_attention_mask_devices)
 
 
 # ---------------------------------------------------------------------------
