@@ -250,10 +250,7 @@ class TranslationTrainer:
                 max_warmup_steps,
                 self.warmup_steps,
             )
-        pct_start = float(self.warmup_steps) / float(max_steps)
-
-        # Learning rate scheduler (FIXED)
-        pct_start = min(max(float(warmup_steps) / float(max_steps), 0.0), 1.0)
+        pct_start = min(max(float(self.warmup_steps) / float(max_steps), 0.0), 1.0)
         self.scheduler = OneCycleLR(
             self.optimizer,
             max_lr=learning_rate,

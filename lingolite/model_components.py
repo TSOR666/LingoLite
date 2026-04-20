@@ -35,15 +35,12 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor (..., dim)
         """
-        # Compute RMS in float32 for stability, then return to input dtype
+        # Compute normalization in float32 for stability, then cast back.
         x_float = x.float()
-        rms = torch.sqrt(torch.mean(x_float ** 2, dim=-1, keepdim=True) + self.eps)
-        rms = rms.to(dtype=x.dtype)
-        
-        # Normalize and scale while preserving input dtype
-        weight = self.weight.to(dtype=x.dtype)
-        x_normed = x / rms
-        return weight * x_normed
+        rms = torch.rsqrt(torch.mean(x_float ** 2, dim=-1, keepdim=True) + self.eps)
+        x_normed = x_float * rms
+        weight = self.weight.to(dtype=x_float.dtype)
+        return (weight * x_normed).to(dtype=x.dtype)
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -219,6 +216,7 @@ class GroupedQueryAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         rope: Optional[RotaryPositionEmbedding] = None,
         kv_cache: Optional['KVCache'] = None,
+        past_key_value: Optional['KVCache'] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional['KVCache']]:
         """
@@ -236,6 +234,12 @@ class GroupedQueryAttention(nn.Module):
             updated_cache: Updated KVCache if use_cache=True, else None
         """
         batch, q_len, _ = query.shape
+
+        cache_input = past_key_value
+        if cache_input is not None:
+            if kv_cache is not None and kv_cache is not cache_input:
+                raise ValueError("Pass only one of 'kv_cache' or 'past_key_value'.")
+            kv_cache = cache_input
 
         # Always project queries
         Q = self.q_proj(query)  # (B, q_len, d_model) -> (B, q_len, n_heads * head_dim)
@@ -308,6 +312,7 @@ class GroupedQueryAttention(nn.Module):
             causal_mask = kv_positions.unsqueeze(0) > query_positions.unsqueeze(-1)
             scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
 
+        valid_mask: Optional[torch.Tensor] = None
         if attention_mask is not None:
             # Support masks shaped (B, kv_len), (B, q_len, kv_len), or (B, 1, q_len, kv_len)
             if attention_mask.dim() == 2:
@@ -318,21 +323,30 @@ class GroupedQueryAttention(nn.Module):
                 raise ValueError(
                     f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
                 )
-            attention_mask = attention_mask.to(device=scores.device, dtype=scores.dtype)
-            # Expect 1 for valid tokens, 0 for masked; convert to additive mask
-            padding_mask = attention_mask == 0
-            scores = scores.masked_fill(padding_mask, float('-inf'))
+            attention_mask = attention_mask.to(device=scores.device)
+            if attention_mask.dtype == torch.bool:
+                mask_values = attention_mask.to(dtype=scores.dtype)
+            else:
+                mask_values = torch.nan_to_num(attention_mask.to(dtype=scores.dtype), nan=0.0)
+            # Binary masks use 1/0; additive masks use 0 for valid and <0 for masked.
+            valid_mask = mask_values > 0 if mask_values.min().item() >= 0 else mask_values >= 0
+            valid_mask = valid_mask.to(device=scores.device, dtype=torch.bool)
+            if valid_mask.shape != scores.shape:
+                valid_mask = valid_mask.expand_as(scores)
+            scores = scores.masked_fill(~valid_mask, float('-inf'))
 
         # Handle fully masked rows explicitly to avoid uniform attention on padding
-        fully_masked = torch.isinf(scores).all(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
-        if fully_masked.any():
+        fully_masked = None
+        if valid_mask is not None:
+            fully_masked = ~valid_mask.any(dim=-1, keepdim=True)  # (B, n_heads, q_len, 1)
+        if fully_masked is not None and fully_masked.any():
             # Zero-out masked rows before softmax to keep output neutral
             scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
         scores_for_softmax = scores.float()  # (B, n_heads, q_len, kv_len)
         attn = F.softmax(scores_for_softmax, dim=-1)
         if attn.dtype != scores.dtype:
             attn = attn.to(dtype=scores.dtype)
-        if fully_masked.any():
+        if fully_masked is not None and fully_masked.any():
             attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
         attn = self.dropout(attn)
 

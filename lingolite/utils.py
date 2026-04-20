@@ -284,6 +284,38 @@ class InputValidator:
         
         logger.debug(f"Validated {name}: {value}")
 
+    @staticmethod
+    def validate_positive_float(
+        value: float,
+        name: str,
+        min_value: float = 0.0,
+        max_value: Optional[float] = None,
+    ) -> None:
+        """
+        Validate a strictly positive floating-point parameter.
+
+        Args:
+            value: Value to validate
+            name: Parameter name
+            min_value: Minimum allowed value
+            max_value: Maximum allowed value (optional)
+
+        Raises:
+            TypeError: If not a real number
+            ValueError: If out of range
+        """
+        if not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a number, got {type(value).__name__}")
+
+        value_f = float(value)
+        if value_f < min_value:
+            raise ValueError(f"{name} must be at least {min_value}, got {value_f}")
+
+        if max_value is not None and value_f > max_value:
+            raise ValueError(f"{name} must be at most {max_value}, got {value_f}")
+
+        logger.debug(f"Validated {name}: {value_f}")
+
 
 # ============================================================================
 # HELPER FUNCTIONS

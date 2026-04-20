@@ -232,6 +232,19 @@ class TestGroupedQueryAttention:
         _, cache = gqa(x2, kv_cache=cache, use_cache=True)
         assert cache.get_seq_len() == 6
 
+    def test_past_key_value_alias(self, gqa: GroupedQueryAttention) -> None:
+        """The legacy past_key_value alias should continue to work."""
+        from lingolite.generation_utils import KVCache
+
+        gqa.eval()
+        cache = KVCache()
+
+        x = torch.randn(1, 3, 64)
+        _, cache = gqa(x, past_key_value=cache, use_cache=True)
+
+        assert cache is not None
+        assert cache.get_seq_len() == 3
+
     def test_causal_masking(self, causal_gqa: GroupedQueryAttention) -> None:
         """Causal attention should not attend to future positions."""
         causal_gqa.eval()
@@ -260,7 +273,7 @@ class TestGroupedQueryAttention:
         # Convert to additive attention mask format: (batch, 1, 1, kv_len)
         # 0 -> -inf (masked), 1 -> 0 (attend)
         attention_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (2, 1, 1, 10)
-        attention_mask = (1.0 - attention_mask) * float('-inf')
+        attention_mask = (1.0 - attention_mask) * -1e4
 
         output, _ = gqa(x, attention_mask=attention_mask)
         assert output.shape == x.shape

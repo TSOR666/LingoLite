@@ -246,6 +246,33 @@ class TestValidateProbability:
 
 
 # ============================================================================
+# InputValidator.validate_positive_float Tests
+# ============================================================================
+
+class TestValidatePositiveFloat:
+    """Tests for positive float validation."""
+
+    def test_valid_positive_float_accepted(self) -> None:
+        """Positive float should not raise."""
+        InputValidator.validate_positive_float(1.5, "temperature", min_value=1e-8)
+
+    def test_zero_rejected_when_min_positive(self) -> None:
+        """Zero should be rejected when a positive minimum is required."""
+        with pytest.raises(ValueError, match="at least"):
+            InputValidator.validate_positive_float(0.0, "temperature", min_value=1e-8)
+
+    def test_negative_rejected(self) -> None:
+        """Negative value should raise ValueError."""
+        with pytest.raises(ValueError, match="at least"):
+            InputValidator.validate_positive_float(-0.1, "temperature", min_value=1e-8)
+
+    def test_max_value_enforced(self) -> None:
+        """Value exceeding max_value should raise ValueError."""
+        with pytest.raises(ValueError, match="at most"):
+            InputValidator.validate_positive_float(2.5, "temperature", min_value=1e-8, max_value=2.0)
+
+
+# ============================================================================
 # Helper Function Tests
 # ============================================================================
 

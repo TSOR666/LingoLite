@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoder_decoder import TransformerDecoder, TransformerEncoder
+from .generation_utils import generate_with_kv_cache, generate_with_beam_search
 from .utils import InputValidator, logger
 
 if TYPE_CHECKING:
@@ -199,7 +200,7 @@ class MobileTranslationModel(nn.Module):
         InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
         InputValidator.validate_positive_int(sos_token_id, "sos_token_id", min_value=0)
         InputValidator.validate_positive_int(eos_token_id, "eos_token_id", min_value=0)
-        InputValidator.validate_probability(temperature, "temperature", allow_zero=False)
+        InputValidator.validate_positive_float(temperature, "temperature", min_value=1e-8)
         InputValidator.validate_positive_int(top_k, "top_k", min_value=0)
         InputValidator.validate_probability(top_p, "top_p")
         InputValidator.validate_positive_int(num_beams, "num_beams", min_value=1)
@@ -420,7 +421,6 @@ class MobileTranslationModel(nn.Module):
         """
         Generate with KV caching for efficiency.
         """
-        from .generation_utils import generate_with_kv_cache
         return generate_with_kv_cache(
             model=self,
             src_input_ids=src_input_ids,
@@ -462,7 +462,6 @@ class MobileTranslationModel(nn.Module):
         Returns:
             Best sequences (batch, max_length)
         """
-        from .generation_utils import generate_with_beam_search
         return generate_with_beam_search(
             model=self,
             src_input_ids=src_input_ids,
