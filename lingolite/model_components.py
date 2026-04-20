@@ -324,13 +324,13 @@ class GroupedQueryAttention(nn.Module):
                     f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
                 )
             attention_mask = attention_mask.to(device=scores.device)
+            # Binary-mask semantics only: nonzero (or True) = valid token, zero = padding.
+            # Avoid the prior `.min().item()` sync, which forced a CPU-GPU barrier in every
+            # attention call and was especially costly during autoregressive decoding.
             if attention_mask.dtype == torch.bool:
-                mask_values = attention_mask.to(dtype=scores.dtype)
+                valid_mask = attention_mask
             else:
-                mask_values = torch.nan_to_num(attention_mask.to(dtype=scores.dtype), nan=0.0)
-            # Binary masks use 1/0; additive masks use 0 for valid and <0 for masked.
-            valid_mask = mask_values > 0 if mask_values.min().item() >= 0 else mask_values >= 0
-            valid_mask = valid_mask.to(device=scores.device, dtype=torch.bool)
+                valid_mask = attention_mask != 0
             if valid_mask.shape != scores.shape:
                 valid_mask = valid_mask.expand_as(scores)
             scores = scores.masked_fill(~valid_mask, float('-inf'))

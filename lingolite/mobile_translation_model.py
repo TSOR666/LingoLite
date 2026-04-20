@@ -127,18 +127,25 @@ class MobileTranslationModel(nn.Module):
             updated_caches: List of LayerKVCache if use_cache=True, else None
             encoder_output: Encoder output (returned for caching)
         """
-        # Input validation
-        InputValidator.validate_tensor(src_input_ids, "src_input_ids", expected_dim=2)
-        InputValidator.validate_tensor(tgt_input_ids, "tgt_input_ids", expected_dim=2)
-        InputValidator.validate_token_ids(src_input_ids, self.vocab_size, "src_input_ids")
-        InputValidator.validate_token_ids(tgt_input_ids, self.vocab_size, "tgt_input_ids")
-
+        # Lightweight shape-only validation: full finite/range checks are intentionally
+        # omitted here because they force CPU-GPU synchronisation on every forward pass
+        # (they are still performed in the public `generate*` APIs that receive raw
+        # user inputs). Use `InputValidator` directly when inputs come from untrusted
+        # sources.
+        InputValidator.validate_tensor(
+            src_input_ids, "src_input_ids", expected_dim=2, check_finite=False
+        )
+        InputValidator.validate_tensor(
+            tgt_input_ids, "tgt_input_ids", expected_dim=2, check_finite=False
+        )
         if src_attention_mask is not None:
-            InputValidator.validate_tensor(src_attention_mask, "src_attention_mask", expected_dim=2)
+            InputValidator.validate_tensor(
+                src_attention_mask, "src_attention_mask", expected_dim=2, check_finite=False
+            )
         if tgt_attention_mask is not None:
-            InputValidator.validate_tensor(tgt_attention_mask, "tgt_attention_mask", expected_dim=2)
-
-        logger.debug(f"Forward pass: src_shape={src_input_ids.shape}, tgt_shape={tgt_input_ids.shape}")
+            InputValidator.validate_tensor(
+                tgt_attention_mask, "tgt_attention_mask", expected_dim=2, check_finite=False
+            )
 
         # Encode source (or use cached encoder output)
         if encoder_output is None:
@@ -217,103 +224,29 @@ class MobileTranslationModel(nn.Module):
                 sos_token_id=sos_token_id,
                 eos_token_id=eos_token_id,
             )
-        
+
         logger.info(f"Generating translation: src_len={src_input_ids.shape[1]}, max_length={max_length}")
 
         # FIXED: Validate and clamp temperature before generation loop
         temperature = max(0.01, float(temperature))
 
-        self.eval()
-        device = src_input_ids.device
-        batch_size = src_input_ids.shape[0]
-
-        with torch.no_grad():
-            # Encode source once
-            encoder_output = self.encoder(
-                input_ids=src_input_ids,
-                attention_mask=src_attention_mask,
-            )
-
-            # Initialize with SOS token
-            generated = torch.full(
-                (batch_size, 1),
-                sos_token_id,
-                dtype=torch.long,
-                device=device
-            )
-
-            # Tracking which sequences are done
-            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-            # Generate tokens autoregressively
-            if max_length < 2:
-                logger.warning(f"max_length={max_length} is too small; raising to 2")
-                max_length = 2
-            for _ in range(max_length - 1):
-                # Create attention mask for generated tokens
-                tgt_mask = torch.ones_like(generated, dtype=torch.float)
-
-                # Decode one step
-                logits, _ = self.decoder(
-                    input_ids=generated,
-                    encoder_output=encoder_output,
-                    self_attention_mask=tgt_mask,
-                    cross_attention_mask=src_attention_mask,
-                    use_cache=False,
-                )
-
-                # Get logits for last position
-                next_token_logits = logits[:, -1, :] / temperature
-
-                if do_sample:
-                    # Apply top-k filtering
-                    if top_k > 0:
-                        indices_to_remove = next_token_logits < torch.topk(
-                            next_token_logits,
-                            min(top_k, next_token_logits.shape[-1]),
-                        )[0][..., -1, None]
-                        next_token_logits[indices_to_remove] = float('-inf')
-
-                    # Apply top-p (nucleus) filtering
-                    if top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-                        # Remove tokens with cumulative probability above threshold
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-
-                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                        next_token_logits[indices_to_remove] = float('-inf')
-
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
-                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-                    else:
-                        next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    # Default deterministic decoding for reproducible translation.
-                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-                
-                # For finished sequences, use padding token
-                next_token = torch.where(
-                    finished.unsqueeze(1),
-                    torch.full_like(next_token, self.pad_token_id),
-                    next_token
-                )
-                
-                # Append to generated sequence
-                generated = torch.cat([generated, next_token], dim=1)
-                
-                # Check if EOS token generated
-                finished = finished | (next_token.squeeze(1) == eos_token_id)
-                
-                # Stop if all sequences are finished
-                if finished.all():
-                    break
-            
-            return generated
+        # Fast path: decoder KV caching turns O(n^2) autoregressive decoding into O(n).
+        # The cached implementation handles argmax (greedy), temperature, top-k, and
+        # top-p sampling; behaviour was aligned with the reference implementation by
+        # threading ``do_sample`` through ``generate_with_kv_cache``.
+        return generate_with_kv_cache(
+            model=self,
+            src_input_ids=src_input_ids,
+            src_attention_mask=src_attention_mask,
+            max_length=max_length,
+            sos_token_id=sos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=self.pad_token_id,
+            temperature=temperature,
+            top_k=top_k if top_k > 0 else None,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
     
     def compute_loss(
         self,
