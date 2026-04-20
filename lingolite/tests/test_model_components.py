@@ -49,6 +49,18 @@ def test_kvcache_to_moves_dtype() -> None:
     assert cache.value is not None and cache.value.dtype == torch.float16
 
 
+def test_kvcache_reorder_moves_batch_entries() -> None:
+    cache = KVCache()
+    key = torch.arange(8, dtype=torch.float32).view(2, 1, 4, 1)
+    val = key + 100
+    cache.update(key, val)
+
+    cache.reorder(torch.tensor([1, 0], dtype=torch.long))
+
+    assert cache.key is not None and torch.equal(cache.key[:, 0, :, 0], torch.tensor([[4.0, 5.0, 6.0, 7.0], [0.0, 1.0, 2.0, 3.0]]))
+    assert cache.value is not None and torch.equal(cache.value[:, 0, :, 0], torch.tensor([[104.0, 105.0, 106.0, 107.0], [100.0, 101.0, 102.0, 103.0]]))
+
+
 def test_gqa_cache_shapes_and_nan_safe() -> None:
     gqa = GroupedQueryAttention(
         d_model=8,

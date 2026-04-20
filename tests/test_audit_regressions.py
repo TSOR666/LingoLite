@@ -22,6 +22,8 @@ from torch.utils.data import DataLoader
 from lingolite.generation_utils import (
     BeamHypothesis,
     BeamSearchScorer,
+    KVCache,
+    LayerKVCache,
     generate_with_beam_search,
     generate_with_kv_cache,
 )
@@ -90,6 +92,56 @@ class _ScriptedModel(torch.nn.Module):
         for token_id, score in plan.items():
             logits[:, -1, token_id] = score
         return logits, None
+
+
+class _CachingScriptedModel(_ScriptedModel):
+    """Beam-search stub that records incremental-cache usage."""
+
+    def __init__(self, vocab_size: int, step_logits):
+        super().__init__(vocab_size=vocab_size, step_logits=step_logits)
+        self.decoder_input_lengths: list[int] = []
+        self.saw_past_key_values = False
+
+    def decoder(
+        self,
+        input_ids,
+        encoder_output,
+        self_attention_mask=None,
+        cross_attention_mask=None,
+        past_key_values=None,
+        use_cache: bool = False,
+    ):
+        self.decoder_input_lengths.append(int(input_ids.shape[1]))
+        if past_key_values is not None:
+            self.saw_past_key_values = True
+
+        logits, _ = super().decoder(
+            input_ids=input_ids,
+            encoder_output=encoder_output,
+            self_attention_mask=self_attention_mask,
+            cross_attention_mask=cross_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+
+        if not use_cache:
+            return logits, None
+
+        batch = input_ids.shape[0]
+        cache = LayerKVCache()
+        cache.self_attn_cache = KVCache(
+            key=torch.zeros(batch, 1, 1, 1),
+            value=torch.zeros(batch, 1, 1, 1),
+            num_heads=1,
+            head_dim=1,
+        )
+        cache.cross_attn_cache = KVCache(
+            key=torch.zeros(batch, 1, 1, 1),
+            value=torch.zeros(batch, 1, 1, 1),
+            num_heads=1,
+            head_dim=1,
+        )
+        return logits, [cache]
 
 
 def test_beam_search_stores_eos_hypothesis_without_consuming_beam_slot() -> None:
@@ -168,6 +220,33 @@ def test_beam_search_preserves_multiple_finished_hypotheses() -> None:
     assert model._step_counter["idx"] >= 2
 
 
+def test_beam_search_uses_incremental_kv_cache() -> None:
+    """Beam search should decode a single token per step and thread caches."""
+    model = _CachingScriptedModel(
+        vocab_size=8,
+        step_logits=[
+            {3: 0.0, 4: -0.2},
+            {2: 0.0},
+            {2: 0.0},
+        ],
+    )
+
+    src = torch.zeros(1, 4, dtype=torch.long)
+    _ = generate_with_beam_search(
+        model=model,
+        src_input_ids=src,
+        max_length=5,
+        num_beams=2,
+        sos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+
+    assert model.decoder_input_lengths
+    assert all(length == 1 for length in model.decoder_input_lengths)
+    assert model.saw_past_key_values
+
+
 # ---------------------------------------------------------------------------
 # Attention mask: no .item() sync, bool + float both supported
 # ---------------------------------------------------------------------------
@@ -226,6 +305,23 @@ def test_attention_accepts_float_binary_mask() -> None:
     out_float, _ = attn(query=x, attention_mask=float_mask)
     out_ref = _reference_attention(attn, x, x, x, ref_mask)
     assert torch.allclose(out_float, out_ref, atol=1e-5)
+
+
+def test_attention_accepts_additive_padding_mask() -> None:
+    torch.manual_seed(0)
+    d_model, n_heads, n_kv = 16, 4, 2
+    attn = GroupedQueryAttention(d_model, n_heads, n_kv, dropout=0.0).eval()
+
+    B, T = 2, 6
+    x = torch.randn(B, T, d_model)
+    additive_mask = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, -1e4, -1e4], [0.0, 0.0, 0.0, -1e4, -1e4, -1e4]]
+    )
+    ref_mask = (additive_mask >= 0)[:, None, None, :]
+
+    out_masked, _ = attn(query=x, attention_mask=additive_mask)
+    out_ref = _reference_attention(attn, x, x, x, ref_mask)
+    assert torch.allclose(out_masked, out_ref, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

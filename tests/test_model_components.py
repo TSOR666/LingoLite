@@ -278,6 +278,30 @@ class TestGroupedQueryAttention:
         output, _ = gqa(x, attention_mask=attention_mask)
         assert output.shape == x.shape
 
+    def test_sdpa_fast_path_used_for_bool_mask(
+        self,
+        gqa: GroupedQueryAttention,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bool padding masks should use the SDPA path when rows are valid."""
+        gqa.eval()
+
+        x = torch.randn(2, 6, 64)
+        mask = torch.ones(2, 6, dtype=torch.bool)
+        calls: list[bool] = []
+        original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        def wrapped_sdpa(*args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(True)
+            return original_sdpa(*args, **kwargs)
+
+        monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", wrapped_sdpa)
+
+        output, _ = gqa(x, attention_mask=mask)
+
+        assert output.shape == x.shape
+        assert calls
+
     def test_head_dimension_validation(self) -> None:
         """Should raise error for invalid head configuration."""
         with pytest.raises(AssertionError):

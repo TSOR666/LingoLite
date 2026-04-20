@@ -279,6 +279,8 @@ class TransformerEncoder(nn.Module):
         # Create attention mask for padding
         if attention_mask is not None:
             attention_mask = attention_mask.to(device=x.device)
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask != 0
             # Convert to (batch, 1, 1, seq_len) for broadcasting
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         
@@ -380,11 +382,15 @@ class TransformerDecoder(nn.Module):
         # Create self-attention mask (causal mask is handled in layer)
         if self_attention_mask is not None:
             self_attention_mask = self_attention_mask.to(device=x.device)
+            if self_attention_mask.dtype != torch.bool:
+                self_attention_mask = self_attention_mask != 0
             self_attention_mask = self_attention_mask.unsqueeze(1).unsqueeze(2)
 
         # Create cross-attention mask
         if cross_attention_mask is not None:
             cross_attention_mask = cross_attention_mask.to(device=x.device)
+            if cross_attention_mask.dtype != torch.bool:
+                cross_attention_mask = cross_attention_mask != 0
             cross_attention_mask = cross_attention_mask.unsqueeze(1).unsqueeze(2)
         
         if use_cache:
