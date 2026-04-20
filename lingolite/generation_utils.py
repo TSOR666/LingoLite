@@ -383,10 +383,11 @@ def generate_with_kv_cache(
     top_k: Optional[int] = None,
     top_p: float = 1.0,
     pad_token_id: int = 0,
+    do_sample: bool = False,
 ) -> torch.Tensor:
     """
     Generate translation with KV caching for 2-3x speedup.
-    
+
     Args:
         model: Translation model
         src_input_ids: Source token IDs (batch, src_len)
@@ -398,7 +399,11 @@ def generate_with_kv_cache(
         top_k: Top-k sampling (0 = disabled)
         top_p: Nucleus sampling (1.0 = disabled)
         pad_token_id: Padding token ID
-    
+        do_sample: If True, sample via multinomial; if False (default), take argmax.
+            Prior versions always sampled, which diverged from the non-cached
+            ``generate()`` default. Keeping ``do_sample=False`` makes greedy
+            decoding deterministic and matches the reference path.
+
     Returns:
         Generated sequences (batch, gen_len)
     """
@@ -463,15 +468,22 @@ def generate_with_kv_cache(
             if top_p < 1.0:
                 next_token_logits = _apply_top_p_filter(next_token_logits, top_p)
 
-            # Check for invalid logits before softmax (e.g., all -inf)
-            if torch.isinf(next_token_logits).all(dim=-1).any() or torch.isnan(next_token_logits).any():
+            if not do_sample:
+                # Deterministic argmax path (matches default `generate()` semantics).
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
             else:
-                probs = F.softmax(next_token_logits, dim=-1)
-                if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
+                # Check for invalid logits before softmax (e.g., all -inf)
+                if (
+                    torch.isinf(next_token_logits).all(dim=-1).any()
+                    or torch.isnan(next_token_logits).any()
+                ):
                     next_token = next_token_logits.argmax(dim=-1, keepdim=True)
                 else:
-                    next_token = torch.multinomial(probs, num_samples=1)
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
+                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+                    else:
+                        next_token = torch.multinomial(probs, num_samples=1)
 
             next_token = torch.where(
                 finished.unsqueeze(1),
@@ -612,77 +624,97 @@ def generate_with_beam_search(
             )
             
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode='floor')
-            # Convert flat indices to beam indices: next_tokens ∈ [0, num_beams*vocab_size) -> [0, num_beams)
-            assert next_indices.max().item() < num_beams, "Beam index out of bounds"
             next_tokens = next_tokens % vocab_size
-            
-            # Select best num_beams for each batch
-            beam_outputs: List[torch.Tensor] = []
-            beam_next_tokens: List[int] = []
-            beam_idx_list: List[int] = []
-            
-            for batch_idx in range(batch_size):
-                if beam_scorer.done[batch_idx]:
-                    # This batch is done, pad all num_beams to maintain shape
-                    first_beam_idx = batch_idx * num_beams
-                    for i in range(num_beams):
-                        beam_outputs.append(input_ids[first_beam_idx + i])
-                        beam_next_tokens.append(pad_token_id)
-                        beam_idx_list.append(first_beam_idx + i)
-                    continue
-                
-                # Select num_beams
-                batch_next_scores: List[float] = []
-                batch_next_tokens: List[torch.Tensor] = []
-                batch_next_indices: List[int] = []
-                
-                for beam_idx in range(num_beams):
-                    if len(batch_next_scores) >= num_beams:
-                        break
-                    
-                    idx = beam_idx
-                    next_token = next_tokens[batch_idx, idx]
-                    next_score = next_scores[batch_idx, idx]
-                    beam_idx_in_batch = int(next_indices[batch_idx, idx].item())
-                    
-                    batch_next_scores.append(float(next_score.item()))
-                    batch_next_tokens.append(next_token)
-                    batch_next_indices.append(beam_idx_in_batch)
-                
-                # Update this batch's beams
-                for i in range(num_beams):
-                    beam_idx_global = batch_idx * num_beams + batch_next_indices[i]
-                    prev_input = input_ids[beam_idx_global]
 
-                    beam_outputs.append(prev_input)
-                    # Convert 0-D tensor to Python int to avoid indexing/concatenation errors
-                    beam_next_tokens.append(int(batch_next_tokens[i].item()))
-                    beam_idx_list.append(beam_idx_global)
-            
-            # Create new input_ids
-            input_ids = torch.cat([
-                input_ids[beam_idx_list],
-                torch.tensor(beam_next_tokens, device=device, dtype=torch.long).unsqueeze(1)
-            ], dim=1)
-            
-            # Flatten scores (avoid Python loop to prevent CPU migration on GPU)
-            beam_scores = next_scores[:, :num_beams].flatten()
-            
-            # Check for EOS and update beam scorer
-            input_ids, beam_scores, done = beam_scorer.process(
-                input_ids=input_ids,
-                next_scores=beam_scores,
-                next_tokens=input_ids[:, -1],
-                next_indices=torch.tensor(beam_idx_list, device=device),
+            # Pull 2*num_beams candidates to host in a single sync to avoid
+            # per-candidate `.item()` calls in the inner selection loop below.
+            cand_tokens_cpu = next_tokens.cpu().tolist()
+            cand_scores_cpu = next_scores.cpu().tolist()
+            cand_beams_cpu = next_indices.cpu().tolist()
+
+            # Pre-allocate per-batch selection buffers sized for num_beams.
+            new_beam_idx_global = [0] * (batch_size * num_beams)
+            new_beam_next_tokens = [pad_token_id] * (batch_size * num_beams)
+            new_beam_scores = [float('-inf')] * (batch_size * num_beams)
+
+            for batch_idx in range(batch_size):
+                first_beam_global = batch_idx * num_beams
+
+                if beam_scorer.done[batch_idx]:
+                    # This batch is done, pad all num_beams to maintain shape.
+                    for i in range(num_beams):
+                        new_beam_idx_global[first_beam_global + i] = first_beam_global + i
+                        new_beam_next_tokens[first_beam_global + i] = pad_token_id
+                        new_beam_scores[first_beam_global + i] = float('-inf')
+                    continue
+
+                selected = 0
+                for cand_pos in range(2 * num_beams):
+                    if selected >= num_beams:
+                        break
+
+                    token_id = int(cand_tokens_cpu[batch_idx][cand_pos])
+                    score = float(cand_scores_cpu[batch_idx][cand_pos])
+                    beam_offset = int(cand_beams_cpu[batch_idx][cand_pos])
+                    source_global = first_beam_global + beam_offset
+
+                    if token_id == eos_token_id:
+                        # Finish this hypothesis but do not consume a live beam slot.
+                        if not bool(beam_scorer.beam_is_finished[batch_idx, beam_offset].item()):
+                            prev_seq = input_ids[source_global]
+                            eos_tensor = torch.tensor(
+                                [eos_token_id], device=prev_seq.device, dtype=prev_seq.dtype
+                            )
+                            full_seq = torch.cat([prev_seq, eos_tensor])
+                            beam_scorer.finished_hypotheses[batch_idx].append(
+                                BeamHypothesis(tokens=full_seq.clone(), score=score)
+                            )
+                            beam_scorer.beam_is_finished[batch_idx, beam_offset] = True
+                        continue
+
+                    slot = first_beam_global + selected
+                    new_beam_idx_global[slot] = source_global
+                    new_beam_next_tokens[slot] = token_id
+                    new_beam_scores[slot] = score
+                    selected += 1
+
+                # If we could not fill all beam slots (rare: all candidates were EOS),
+                # pad remaining slots with the first candidate's source beam so the
+                # tensor shape stays consistent. These slots are suppressed to -inf.
+                while selected < num_beams:
+                    slot = first_beam_global + selected
+                    fallback_beam = int(cand_beams_cpu[batch_idx][0])
+                    new_beam_idx_global[slot] = first_beam_global + fallback_beam
+                    new_beam_next_tokens[slot] = pad_token_id
+                    new_beam_scores[slot] = float('-inf')
+                    selected += 1
+
+                # Early-stopping bookkeeping: a batch is done when it has gathered
+                # num_beams finished hypotheses (mirrors BeamSearchScorer semantics).
+                if early_stopping:
+                    if len(beam_scorer.finished_hypotheses[batch_idx]) >= num_beams:
+                        beam_scorer.done[batch_idx] = True
+                else:
+                    if bool(beam_scorer.beam_is_finished[batch_idx].all().item()):
+                        beam_scorer.done[batch_idx] = True
+
+            # Create new input_ids using the selected live beams.
+            input_ids = torch.cat(
+                [
+                    input_ids[new_beam_idx_global],
+                    torch.tensor(
+                        new_beam_next_tokens, device=device, dtype=torch.long
+                    ).unsqueeze(1),
+                ],
+                dim=1,
             )
 
-            # Suppress beams that have emitted EOS to prevent them from continuing
-            # This prevents completed beams from crowding out unfinished ones
-            eos_mask = input_ids[:, -1] == eos_token_id
-            beam_scores = beam_scores.masked_fill(eos_mask, float('-inf'))
+            beam_scores = torch.tensor(
+                new_beam_scores, device=device, dtype=torch.float32
+            )
 
             # Early stopping
-            if done.all():
+            if beam_scorer.done.all().item():
                 logger.info(f"Beam search early stopping at step {step + 1}")
                 break
         

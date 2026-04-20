@@ -312,10 +312,9 @@ class TransformerDecoder(nn.Module):
         super().__init__()
 
         self.d_model = d_model
-        self.embedding_scale = math.sqrt(d_model)  # Cache for performance
-        self.tie_embeddings = tie_embeddings
         # Cache scaling factor to avoid computing sqrt every forward pass
         self.embedding_scale = math.sqrt(d_model)
+        self.tie_embeddings = tie_embeddings
 
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)

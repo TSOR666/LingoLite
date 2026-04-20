@@ -231,13 +231,36 @@ class TranslationTrainer:
 
         self.max_steps = max_steps
 
-        # Optimizer
+        # Build weight-decay parameter groups: exclude normalisation weights and
+        # embeddings from L2 decay (standard transformer training practice).
+        # Biases are already disabled in this architecture, so we only have to
+        # filter on parameter names.
+        decay_params: List[torch.nn.Parameter] = []
+        no_decay_params: List[torch.nn.Parameter] = []
+        seen_param_ids: set[int] = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Skip duplicates introduced by weight tying (encoder.embedding is
+            # aliased to decoder.embedding and to decoder.lm_head).
+            pid = id(param)
+            if pid in seen_param_ids:
+                continue
+            seen_param_ids.add(pid)
+            lowered = name.lower()
+            if "norm" in lowered or "embedding" in lowered or name.endswith(".bias"):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
         self.optimizer = AdamW(
-            model.parameters(),
+            [
+                {"params": decay_params, "weight_decay": weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
             lr=learning_rate,
             betas=(0.9, 0.98),
             eps=1e-9,
-            weight_decay=weight_decay,
         )
 
         # Clamp warmup to keep OneCycleLR pct_start in [0, 1).
@@ -368,34 +391,49 @@ class TranslationTrainer:
         }
     
     def save_checkpoint(self, filename: str) -> None:
-        """Save model checkpoint."""
+        """Save model checkpoint with RNG state for deterministic resume."""
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'global_step': self.global_step,
             'best_val_loss': self.best_val_loss,
+            # RNG state tensors are plain ByteTensors and are compatible with
+            # torch.load(..., weights_only=True).
+            'torch_rng_state': torch.get_rng_state(),
         }
+        if torch.cuda.is_available():
+            checkpoint['torch_cuda_rng_state'] = torch.cuda.get_rng_state_all()
 
         checkpoint_path = Path(filename)
         save_path = checkpoint_path if checkpoint_path.is_absolute() else self.save_dir / checkpoint_path
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, save_path)
         print(f"[OK] Checkpoint saved: {save_path}")
-    
+
     def load_checkpoint(self, filename: str) -> None:
         """Load model checkpoint."""
         checkpoint_path = Path(filename)
         load_path = checkpoint_path if checkpoint_path.is_absolute() else self.save_dir / checkpoint_path
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
         checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
-        
+
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
-        
+
+        # Restore RNG state if the checkpoint contains it (older checkpoints omit).
+        if 'torch_rng_state' in checkpoint:
+            torch.set_rng_state(checkpoint['torch_rng_state'].to('cpu'))
+        cuda_rng = checkpoint.get('torch_cuda_rng_state')
+        if cuda_rng is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            except Exception as exc:  # mismatched device count etc.
+                logger.warning("Could not restore CUDA RNG state: %s", exc)
+
         print(f"[OK] Checkpoint loaded: {load_path}")
     
     def train(
