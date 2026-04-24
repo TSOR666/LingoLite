@@ -82,14 +82,19 @@ class MobileTranslationModel(nn.Module):
             tie_embeddings=tie_embeddings,
         )
         
+        # Initialize weights BEFORE sharing/tying so the shared embedding is
+        # not double-initialized (the previous order initialized the embedding
+        # Parameter three times — once as encoder.embedding, again as
+        # decoder.embedding, and a third time via decoder.lm_head's Linear init;
+        # harmless while all three call ``normal_(0, 0.02)`` but a footgun if
+        # ``_init_weights`` ever diverges between Embedding and Linear).
+        self.apply(self._init_weights)
+
         # Share embeddings between encoder and decoder
         self.decoder.embedding = self.encoder.embedding
         # Re-tie LM head to the shared embedding if weight tying is enabled
         if tie_embeddings:
             self.decoder.lm_head.weight = self.decoder.embedding.weight
-        
-        # Initialize weights
-        self.apply(self._init_weights)
         
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights with appropriate distributions."""

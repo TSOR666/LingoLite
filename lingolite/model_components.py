@@ -205,9 +205,55 @@ class GroupedQueryAttention(nn.Module):
         self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
-        
+
+        # Store dropout probability as a float; a full ``nn.Dropout`` module is
+        # unused (SDPA takes the probability directly and the layer already has
+        # its own residual dropout).
+        self.dropout_p = float(dropout)
+        # Kept for backwards compatibility: older checkpoints / code paths may
+        # reference ``self.dropout`` as a Module. It is never applied to the
+        # attention output in the forward pass.
         self.dropout = nn.Dropout(dropout)
-        
+
+        # Causal mask cache. Building ``torch.arange(kv_len)`` + compare on
+        # every forward pass is cheap per call but multiplies across layers and
+        # steps; cache the largest triangular mask we've seen and slice into
+        # it. Registered as a non-persistent buffer so ``.to(device)`` moves
+        # it along with the module and it is kept out of checkpoints.
+        self.register_buffer(
+            "_causal_mask_cache", torch.empty(0, dtype=torch.bool), persistent=False
+        )
+
+    def _get_causal_mask(
+        self, q_len: int, kv_len: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return a cached ``(1, 1, q_len, kv_len)`` bool causal mask.
+
+        The cache stores a single ``(N, N)`` triangular mask sized to the
+        largest ``kv_len`` seen and slices into it on subsequent calls.
+        """
+        cache = self._causal_mask_cache
+        need_rebuild = (
+            cache.numel() == 0
+            or cache.shape[0] < kv_len
+            or cache.device != device
+        )
+        if need_rebuild:
+            new_size = max(kv_len, cache.shape[0] if cache.numel() else 0)
+            positions = torch.arange(new_size, device=device)
+            full = positions.unsqueeze(0) <= positions.unsqueeze(-1)
+            self._causal_mask_cache = full
+            cache = full
+
+        if q_len == kv_len:
+            sub = cache[:q_len, :kv_len]
+        else:
+            # During cached generation q_len < kv_len: the new query positions
+            # are the final q_len rows of the larger triangular matrix.
+            start = kv_len - q_len
+            sub = cache[start:start + q_len, :kv_len]
+        return sub.unsqueeze(0).unsqueeze(0)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -253,8 +299,13 @@ class GroupedQueryAttention(nn.Module):
 
         # Determine whether we need to compute new keys/values
         if self.is_cross_attn and past_key is not None and past_value is not None:
+            # Cross-attention: reuse the single cached projection.
             K = past_key
             V = past_value
+            # Align cached tensors with the query dtype/device.
+            if K.device != query.device or K.dtype != Q.dtype:
+                K = K.to(device=query.device, dtype=Q.dtype)
+                V = V.to(device=query.device, dtype=Q.dtype)
         else:
             # For self-attention, reuse query as key/value
             if key is None:
@@ -262,26 +313,42 @@ class GroupedQueryAttention(nn.Module):
             if value is None:
                 value = query
 
-            kv_len = key.shape[1]
+            new_kv_len = key.shape[1]
 
-            K = self.k_proj(key)  # (B, kv_len, d_model) -> (B, kv_len, n_kv_heads * head_dim)
-            V = self.v_proj(value)  # (B, kv_len, d_model) -> (B, kv_len, n_kv_heads * head_dim)
+            K_new = self.k_proj(key)
+            V_new = self.v_proj(value)
 
-            K = K.view(batch, kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, kv_len, n_kv_heads * head_dim) -> (B, n_kv_heads, kv_len, head_dim)
-            V = V.view(batch, kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, kv_len, n_kv_heads * head_dim) -> (B, n_kv_heads, kv_len, head_dim)
+            K_new = K_new.view(batch, new_kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            V_new = V_new.view(batch, new_kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
 
             if rope is not None and not self.is_cross_attn:
                 past_len = 0 if past_key is None else past_key.shape[2]
-                Q, K = rope(Q, K, offset=past_len)
+                Q, K_new = rope(Q, K_new, offset=past_len)
 
-            if past_key is not None and past_value is not None:
-                # Align cached tensors with current device/dtype before concatenation
-                past_key = past_key.to(device=K.device, dtype=K.dtype)
-                past_value = past_value.to(device=V.device, dtype=V.dtype)
-                K = torch.cat([past_key, K], dim=2)
-                V = torch.cat([past_value, V], dim=2)
+            if use_cache and kv_cache is not None:
+                # Append the new slice through the cache: in reserved mode this
+                # writes into the pre-allocated buffer (no torch.cat); in lazy
+                # mode it falls back to the historical concatenation path.
+                if K_new.device != query.device or K_new.dtype != Q.dtype:
+                    K_new = K_new.to(device=query.device, dtype=Q.dtype)
+                    V_new = V_new.to(device=query.device, dtype=Q.dtype)
+                kv_cache.update(K_new, V_new)
+                K = kv_cache.key
+                V = kv_cache.value
+            elif past_key is not None and past_value is not None:
+                # Legacy path: caller supplied raw past tensors without a cache
+                # object. Mirror the previous torch.cat semantics.
+                past_key_aligned = past_key.to(device=K_new.device, dtype=K_new.dtype)
+                past_value_aligned = past_value.to(device=V_new.device, dtype=V_new.dtype)
+                K = torch.cat([past_key_aligned, K_new], dim=2)
+                V = torch.cat([past_value_aligned, V_new], dim=2)
+            else:
+                K = K_new
+                V = V_new
 
-        # Keep K/V aligned with the query for safe device/dtype usage
+        # Final alignment (covers the cross-attn-no-cache path and any stale
+        # tensors that slipped through). The checks above mean this is usually
+        # a no-op.
         if K.device != query.device or V.device != query.device:
             K = K.to(device=query.device)
             V = V.to(device=query.device)
@@ -289,7 +356,6 @@ class GroupedQueryAttention(nn.Module):
             K = K.to(dtype=Q.dtype)
             V = V.to(dtype=Q.dtype)
 
-        present = (K, V) if use_cache else None
         kv_len = K.shape[2]
 
         valid_mask: Optional[torch.Tensor] = None
@@ -307,40 +373,38 @@ class GroupedQueryAttention(nn.Module):
             if attention_mask.dtype == torch.bool:
                 valid_mask = attention_mask
             else:
-                # Support both binary masks (1=keep, 0=mask) and common additive masks
-                # (0=keep, negative=mask) without synchronizing back to Python.
-                binary_valid_mask = attention_mask != 0
-                additive_valid_mask = attention_mask >= 0
-                has_negative_values = (attention_mask < 0).any()
-                valid_mask = torch.where(
-                    has_negative_values,
-                    additive_valid_mask,
-                    binary_valid_mask,
-                )
+                # Support binary (1=keep, 0=mask) and additive (0=keep, neg=mask)
+                # masks without a CPU sync. ``any()``/``all()`` branching forces
+                # a device-host round trip on every attention call; instead we
+                # derive both interpretations and pick element-wise.
+                is_numeric = attention_mask.to(torch.float32)
+                binary_valid = attention_mask != 0
+                additive_valid = attention_mask >= 0
+                has_negative = (is_numeric < 0.0).any(dim=-1, keepdim=True)
+                valid_mask = torch.where(has_negative, additive_valid, binary_valid)
 
         if self.is_causal:
-            kv_positions = torch.arange(kv_len, device=Q.device)
-            query_positions = torch.arange(q_len, device=Q.device)
-            if past_key is not None and kv_len >= q_len:
-                query_positions = query_positions + (kv_len - q_len)
-            causal_valid_mask = kv_positions.unsqueeze(0) <= query_positions.unsqueeze(-1)
-            causal_valid_mask = causal_valid_mask.unsqueeze(0).unsqueeze(0)
+            causal_valid_mask = self._get_causal_mask(q_len, kv_len, Q.device)
             valid_mask = (
                 causal_valid_mask
                 if valid_mask is None
                 else valid_mask & causal_valid_mask
             )
 
-        fully_masked = None
+        # Compute ``fully_masked`` unconditionally; zeroing out its rows is cheap
+        # and avoids the CPU sync of an ``any().item()`` check that was present
+        # on the previous fast/slow path branch.
+        fully_masked: Optional[torch.Tensor] = None
         if valid_mask is not None:
             fully_masked = ~valid_mask.any(dim=-1, keepdim=True)
+            # Neutralise fully-masked rows inside the mask itself so both SDPA
+            # and the manual path see at least one valid key. We then zero the
+            # output rows after the attention op.
+            valid_mask = valid_mask | fully_masked
 
-        dropout_p = self.dropout.p if self.training else 0.0
-        can_use_sdpa = hasattr(F, "scaled_dot_product_attention")
-        if fully_masked is not None and bool(fully_masked.any().item()):
-            can_use_sdpa = False
+        dropout_p = self.dropout_p if self.training else 0.0
 
-        if can_use_sdpa:
+        if hasattr(F, "scaled_dot_product_attention"):
             try:
                 output = F.scaled_dot_product_attention(
                     Q,
@@ -376,30 +440,37 @@ class GroupedQueryAttention(nn.Module):
                     mask_for_scores = mask_for_scores.expand_as(scores)
                 scores = scores.masked_fill(~mask_for_scores, float('-inf'))
 
-            if fully_masked is not None and bool(fully_masked.any().item()):
-                scores = torch.where(fully_masked, torch.zeros_like(scores), scores)
-
             attn = F.softmax(scores.float(), dim=-1).to(dtype=scores.dtype)
-            if fully_masked is not None and bool(fully_masked.any().item()):
-                attn = torch.where(fully_masked, torch.zeros_like(attn), attn)
             if dropout_p > 0.0:
                 attn = F.dropout(attn, p=dropout_p, training=True)
 
             output = torch.matmul(attn, V_for_scores)
 
+        if fully_masked is not None:
+            # Zero out query positions that had no valid keys (sync-free).
+            output = torch.where(fully_masked, torch.zeros_like(output), output)
+
         output = output.transpose(1, 2).contiguous().view(batch, q_len, -1)  # (B, n_heads, q_len, head_dim) -> (B, q_len, n_heads * head_dim)
         output = self.o_proj(output)
 
-        # Convert present tuple to KVCache if needed
+        # Return the cache object that was just updated in-place (same instance
+        # as ``kv_cache``/``past_key_value`` when the caller provided one). The
+        # caller can treat it as opaque; its ``.key`` / ``.value`` properties
+        # expose the valid history slice.
         updated_cache = None
-        if use_cache and present is not None:
-            from .generation_utils import KVCache
-            updated_cache = KVCache(
-                key=present[0],
-                value=present[1],
-                num_heads=self.n_kv_heads,
-                head_dim=self.head_dim,
-            )
+        if use_cache:
+            if kv_cache is None:
+                # Caller used the legacy "no cache object" path; synthesize one
+                # around the freshly materialized K / V tensors.
+                from .generation_utils import KVCache as _KVCache
+                updated_cache = _KVCache(
+                    key=K,
+                    value=V,
+                    num_heads=self.n_kv_heads,
+                    head_dim=self.head_dim,
+                )
+            else:
+                updated_cache = kv_cache
 
         return output, updated_cache
 
