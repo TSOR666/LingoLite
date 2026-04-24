@@ -6,7 +6,7 @@ Includes KV caching and beam search for efficient and high-quality generation
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -31,18 +31,105 @@ __all__ = [
 # KV CACHE DATA STRUCTURE
 # ============================================================================
 
-@dataclass
 class KVCache:
     """
     Key-Value cache for efficient autoregressive generation.
-    Stores past key and value tensors to avoid recomputation.
-    Shapes are tracked to prevent mixing full heads and grouped KV heads.
+
+    Two storage modes are supported transparently:
+
+    * **Lazy mode** (default): the cache starts empty; ``update`` concatenates
+      each new step into a fresh ``torch.cat`` tensor. O(n) work per step and
+      O(n²) total memory churn over a decode. Matches the historical behaviour.
+    * **Reserved mode**: call :meth:`reserve` once at the start of a decode
+      with an upper-bound ``max_len``. ``update`` then copies new K/V slices
+      into a pre-allocated buffer in-place and only exposes the valid prefix.
+      Converts a full decode to O(n) work *and* O(n) peak memory.
     """
-    key: Optional[torch.Tensor] = None  # (batch, n_kv_heads, seq_len, head_dim)
-    value: Optional[torch.Tensor] = None  # (batch, n_kv_heads, seq_len, head_dim)
-    num_heads: Optional[int] = None
-    head_dim: Optional[int] = None
-    
+
+    __slots__ = (
+        "_key_buf",
+        "_value_buf",
+        "_length",
+        "_capacity",
+        "num_heads",
+        "head_dim",
+    )
+
+    def __init__(
+        self,
+        key: Optional[torch.Tensor] = None,
+        value: Optional[torch.Tensor] = None,
+        num_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+    ) -> None:
+        self._key_buf: Optional[torch.Tensor] = key
+        self._value_buf: Optional[torch.Tensor] = value
+        self._length: int = 0 if key is None else int(key.shape[2])
+        # ``_capacity`` is ``None`` in lazy mode; set in :meth:`reserve`.
+        self._capacity: Optional[int] = None
+        self.num_heads = num_heads if num_heads is not None else (key.shape[1] if key is not None else None)
+        self.head_dim = head_dim if head_dim is not None else (key.shape[3] if key is not None else None)
+
+    # ------------------------------------------------------------------
+    # Public tensor views (backward compatible with the dataclass API)
+    # ------------------------------------------------------------------
+    @property
+    def key(self) -> Optional[torch.Tensor]:
+        if self._key_buf is None or self._length == 0:
+            return None
+        if self._capacity is None:
+            return self._key_buf
+        return self._key_buf[:, :, : self._length, :]
+
+    @key.setter
+    def key(self, value: Optional[torch.Tensor]) -> None:
+        self._key_buf = value
+        self._length = 0 if value is None else int(value.shape[2])
+        self._capacity = None
+
+    @property
+    def value(self) -> Optional[torch.Tensor]:
+        if self._value_buf is None or self._length == 0:
+            return None
+        if self._capacity is None:
+            return self._value_buf
+        return self._value_buf[:, :, : self._length, :]
+
+    @value.setter
+    def value(self, v: Optional[torch.Tensor]) -> None:
+        self._value_buf = v
+        # length already set by key setter in normal usage; keep in sync if
+        # only ``value`` is reassigned.
+        if v is not None and self._length == 0:
+            self._length = int(v.shape[2])
+
+    # ------------------------------------------------------------------
+    # Pre-allocation
+    # ------------------------------------------------------------------
+    def reserve(
+        self,
+        batch: int,
+        heads: int,
+        max_len: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> 'KVCache':
+        """Allocate a fixed (batch, heads, max_len, head_dim) buffer.
+
+        After ``reserve`` the cache is empty (``_length = 0``); call
+        :meth:`update` to append new K/V slices in-place.
+        """
+        if max_len <= 0:
+            raise ValueError("max_len must be positive")
+        self._key_buf = torch.empty(batch, heads, max_len, head_dim, device=device, dtype=dtype)
+        self._value_buf = torch.empty(batch, heads, max_len, head_dim, device=device, dtype=dtype)
+        self._capacity = max_len
+        self._length = 0
+        self.num_heads = heads
+        self.head_dim = head_dim
+        return self
+
     def _validate_new(self, new_key: torch.Tensor, new_value: torch.Tensor) -> None:
         if new_key.ndim != 4 or new_value.ndim != 4:
             raise ValueError("KVCache expects 4D tensors shaped (batch, heads, seq_len, head_dim)")
@@ -61,10 +148,10 @@ class KVCache:
                 f"got heads={heads}, head_dim={head_dim}"
             )
 
-        if self.key is not None:
-            if self.key.shape[0] != batch:
+        if self._key_buf is not None:
+            if self._key_buf.shape[0] != batch:
                 raise ValueError("KVCache batch size mismatch during update")
-            if self.key.shape[1] != heads or self.key.shape[3] != head_dim:
+            if self._key_buf.shape[1] != heads or self._key_buf.shape[3] != head_dim:
                 raise ValueError("KVCache head dimensions changed during update")
 
     def update(
@@ -72,55 +159,68 @@ class KVCache:
         new_key: torch.Tensor,
         new_value: torch.Tensor,
     ) -> 'KVCache':
-        """
-        Update cache with new key-value pairs.
+        """Append new K/V slices.
 
-        Args:
-            new_key: New key tensor (batch, n_kv_heads, new_len, head_dim)
-            new_value: New value tensor (batch, n_kv_heads, new_len, head_dim)
-
-        Returns:
-            Updated KVCache instance
+        In reserved mode the new slice is copied into the pre-allocated buffer
+        at the current write head (no ``torch.cat``). In lazy mode this falls
+        back to ``torch.cat`` along the sequence dim.
         """
         self._validate_new(new_key, new_value)
+        new_len = int(new_key.shape[2])
 
-        if self.key is None or self.value is None:
-            self.key = new_key
-            self.value = new_value
+        if self._capacity is not None and self._key_buf is not None and self._value_buf is not None:
+            end = self._length + new_len
+            if end <= self._capacity:
+                self._key_buf[:, :, self._length:end, :].copy_(new_key)
+                self._value_buf[:, :, self._length:end, :].copy_(new_value)
+                self._length = end
+                return self
+            # Over capacity: drop back to lazy ``torch.cat`` semantics so the
+            # cache still works, at the cost of an extra allocation.
+            existing_key = self._key_buf[:, :, : self._length, :]
+            existing_value = self._value_buf[:, :, : self._length, :]
+            self._key_buf = torch.cat([existing_key, new_key], dim=2)
+            self._value_buf = torch.cat([existing_value, new_value], dim=2)
+            self._length = self._key_buf.shape[2]
+            self._capacity = None
+            return self
+
+        if self._key_buf is None or self._value_buf is None:
+            self._key_buf = new_key
+            self._value_buf = new_value
+            self._length = new_len
         else:
-            # Concatenate along sequence dimension
-            self.key = torch.cat([self.key, new_key], dim=2)
-            self.value = torch.cat([self.value, new_value], dim=2)
-
+            self._key_buf = torch.cat([self._key_buf, new_key], dim=2)
+            self._value_buf = torch.cat([self._value_buf, new_value], dim=2)
+            self._length = self._key_buf.shape[2]
         return self
 
     def as_tuple(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return cache as tuple if populated."""
-        if self.key is None or self.value is None:
+        k, v = self.key, self.value
+        if k is None or v is None:
             return None
-        return self.key, self.value
+        return k, v
 
     def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> 'KVCache':
         """Move cache tensors to device/dtype."""
-        if self.key is not None:
-            self.key = self.key.to(device=device, dtype=dtype)
-        if self.value is not None:
-            self.value = self.value.to(device=device, dtype=dtype)
+        if self._key_buf is not None:
+            self._key_buf = self._key_buf.to(device=device, dtype=dtype)
+        if self._value_buf is not None:
+            self._value_buf = self._value_buf.to(device=device, dtype=dtype)
         return self
 
     def reorder(self, beam_indices: torch.Tensor) -> 'KVCache':
         """Reorder cached batch entries after beam selection."""
-        if self.key is None or self.value is None:
+        if self._key_buf is None or self._value_buf is None:
             return self
-        self.key = self.key.index_select(0, beam_indices.to(device=self.key.device))
-        self.value = self.value.index_select(0, beam_indices.to(device=self.value.device))
+        self._key_buf = self._key_buf.index_select(0, beam_indices.to(device=self._key_buf.device))
+        self._value_buf = self._value_buf.index_select(0, beam_indices.to(device=self._value_buf.device))
         return self
-    
+
     def get_seq_len(self) -> int:
         """Get current sequence length in cache."""
-        if self.key is None:
-            return 0
-        return self.key.shape[2]
+        return self._length
 
 
 class LayerKVCache:
@@ -149,6 +249,48 @@ def _reorder_past_key_values(
     if past_key_values is None:
         return None
     return [layer_cache.reorder(beam_indices) for layer_cache in past_key_values]
+
+
+def _build_preallocated_caches(
+    model: "MobileTranslationModel",
+    batch_size: int,
+    max_length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> List[LayerKVCache]:
+    """Create pre-allocated KV caches for the decoder's self-attention blocks.
+
+    Falls back to empty (lazy-cat) caches if the decoder does not expose the
+    expected introspection attributes (e.g. under tests that monkey-patch
+    ``model.decoder`` with a non-standard object).
+    """
+    decoder = getattr(model, "decoder", None)
+    layers = getattr(decoder, "_decoder_layers", None) or getattr(decoder, "layers", None)
+    if layers is None:
+        return []
+
+    try:
+        first_self_attn = layers[0].self_attn
+        n_kv_heads = int(first_self_attn.n_kv_heads)
+        head_dim = int(first_self_attn.head_dim)
+    except (AttributeError, IndexError, TypeError):
+        # Introspection failed; return lazy caches so behaviour matches the
+        # pre-audit code path.
+        return [LayerKVCache() for _ in layers]
+
+    caches: List[LayerKVCache] = []
+    for _ in layers:
+        layer_cache = LayerKVCache()
+        layer_cache.self_attn_cache.reserve(
+            batch=batch_size,
+            heads=n_kv_heads,
+            max_len=max_length,
+            head_dim=head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        caches.append(layer_cache)
+    return caches
 
 
 def _apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -462,11 +604,25 @@ def generate_with_kv_cache(
 
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        past_key_values = [LayerKVCache().to(device) for _ in model.decoder.layers]
+        # Pre-allocate self-attention KV buffers for the whole decode up-front
+        # so each step writes into a fixed buffer instead of allocating a new
+        # concatenated tensor. Cross-attention KV is populated on the first
+        # decoder call and then reused (shape stays constant).
+        past_key_values = _build_preallocated_caches(
+            model=model,
+            batch_size=batch_size,
+            max_length=max_length,
+            device=device,
+            dtype=encoder_output.dtype,
+        )
+
+        # Per-step target-side mask is always a single valid token; pre-allocate
+        # it once so the decode loop doesn't repeatedly ``ones_like`` / move a
+        # fresh tensor onto the device on every step.
+        tgt_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
 
         for step in range(max_length - 1):
             decoder_input = generated[:, -1:]
-            tgt_mask = torch.ones_like(decoder_input, dtype=torch.bool, device=device)
 
             decoder_outputs = model.decoder(
                 input_ids=decoder_input,
@@ -495,18 +651,26 @@ def generate_with_kv_cache(
                 # Deterministic argmax path (matches default `generate()` semantics).
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
             else:
-                # Check for invalid logits before softmax (e.g., all -inf)
-                if (
-                    torch.isinf(next_token_logits).all(dim=-1).any()
-                    or torch.isnan(next_token_logits).any()
-                ):
-                    next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-                else:
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    if torch.isnan(probs).any() or (probs.sum(dim=-1) == 0).any():
-                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-                    else:
-                        next_token = torch.multinomial(probs, num_samples=1)
+                # Nan-safe softmax without three separate CPU-GPU syncs.
+                # nan_to_num replaces inf/nan in-place on the GPU; rows where
+                # every logit was masked out collapse to a uniform distribution
+                # which still gives a valid categorical sample.
+                safe_logits = torch.nan_to_num(
+                    next_token_logits,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=float("-1e30"),
+                )
+                probs = F.softmax(safe_logits, dim=-1)
+                # Guard against rows that summed to 0 (all -inf post-filtering)
+                # by falling back to argmax on the original logits for those rows.
+                row_sums = probs.sum(dim=-1, keepdim=True)
+                empty_rows = row_sums <= 0
+                fallback = F.one_hot(
+                    next_token_logits.argmax(dim=-1), probs.shape[-1]
+                ).to(probs.dtype)
+                probs = torch.where(empty_rows, fallback, probs)
+                next_token = torch.multinomial(probs, num_samples=1)
 
             next_token = torch.where(
                 finished.unsqueeze(1),
@@ -611,12 +775,24 @@ def generate_with_beam_search(
         beam_scores = torch.full((batch_size * num_beams,), float('-inf'), device=device)
         # Activate first beam of each batch (indices 0, num_beams, 2*num_beams, ...)
         beam_scores[::num_beams] = 0.0
-        past_key_values: Optional[List[LayerKVCache]] = None
+
+        # Pre-allocate self-attention KV cache buffers per-beam. Cross-attention
+        # is populated once on the first decoder call and never grows.
+        past_key_values: Optional[List[LayerKVCache]] = _build_preallocated_caches(
+            model=model,
+            batch_size=batch_size * num_beams,
+            max_length=max_length,
+            device=device,
+            dtype=encoder_output.dtype,
+        )
         
+        # Per-step self-attention mask is a single valid token per beam;
+        # pre-allocate once to avoid a fresh ``ones_like`` every step.
+        tgt_mask = torch.ones(batch_size * num_beams, 1, dtype=torch.bool, device=device)
+
         # Generate
         for step in range(max_length - 1):
             decoder_input = input_ids[:, -1:]
-            tgt_mask = torch.ones_like(decoder_input, dtype=torch.bool, device=device)
 
             logits, updated_past_key_values = model.decoder(
                 input_ids=decoder_input,
@@ -660,15 +836,27 @@ def generate_with_beam_search(
             cand_scores_cpu = next_scores.cpu().tolist()
             cand_beams_cpu = next_indices.cpu().tolist()
 
+            # Snapshot the per-beam-finished flags and the done flags once per
+            # step as Python lists so the inner candidate loop does not perform
+            # a CPU-GPU sync on every iteration (previously ``.item()`` was
+            # called O(batch * 2 * num_beams) times per step).
+            beam_finished_cpu = beam_scorer.beam_is_finished.tolist()
+            done_cpu = beam_scorer.done.tolist()
+
             # Pre-allocate per-batch selection buffers sized for num_beams.
             new_beam_idx_global = [0] * (batch_size * num_beams)
             new_beam_next_tokens = [pad_token_id] * (batch_size * num_beams)
             new_beam_scores = [float('-inf')] * (batch_size * num_beams)
 
+            # Collect per-batch finished-state updates to apply to the scorer
+            # tensors once at the end of the step (one scatter instead of many).
+            finished_updates: List[Tuple[int, int]] = []
+            done_updates: List[int] = []
+
             for batch_idx in range(batch_size):
                 first_beam_global = batch_idx * num_beams
 
-                if beam_scorer.done[batch_idx]:
+                if done_cpu[batch_idx]:
                     # This batch is done, pad all num_beams to maintain shape.
                     for i in range(num_beams):
                         new_beam_idx_global[first_beam_global + i] = first_beam_global + i
@@ -688,7 +876,7 @@ def generate_with_beam_search(
 
                     if token_id == eos_token_id:
                         # Finish this hypothesis but do not consume a live beam slot.
-                        if not bool(beam_scorer.beam_is_finished[batch_idx, beam_offset].item()):
+                        if not beam_finished_cpu[batch_idx][beam_offset]:
                             prev_seq = input_ids[source_global]
                             eos_tensor = torch.tensor(
                                 [eos_token_id], device=prev_seq.device, dtype=prev_seq.dtype
@@ -697,7 +885,8 @@ def generate_with_beam_search(
                             beam_scorer.finished_hypotheses[batch_idx].append(
                                 BeamHypothesis(tokens=full_seq.clone(), score=score)
                             )
-                            beam_scorer.beam_is_finished[batch_idx, beam_offset] = True
+                            beam_finished_cpu[batch_idx][beam_offset] = True
+                            finished_updates.append((batch_idx, beam_offset))
                         continue
 
                     slot = first_beam_global + selected
@@ -721,10 +910,16 @@ def generate_with_beam_search(
                 # num_beams finished hypotheses (mirrors BeamSearchScorer semantics).
                 if early_stopping:
                     if len(beam_scorer.finished_hypotheses[batch_idx]) >= num_beams:
-                        beam_scorer.done[batch_idx] = True
+                        done_updates.append(batch_idx)
                 else:
-                    if bool(beam_scorer.beam_is_finished[batch_idx].all().item()):
-                        beam_scorer.done[batch_idx] = True
+                    if all(beam_finished_cpu[batch_idx]):
+                        done_updates.append(batch_idx)
+
+            # Flush per-step bookkeeping to the scorer tensors in one shot.
+            for bi, bo in finished_updates:
+                beam_scorer.beam_is_finished[bi, bo] = True
+            for bi in done_updates:
+                beam_scorer.done[bi] = True
 
             # Create new input_ids using the selected live beams.
             beam_idx_tensor = torch.tensor(
@@ -738,13 +933,20 @@ def generate_with_beam_search(
             beam_scores = torch.tensor(
                 new_beam_scores, device=device, dtype=torch.float32
             )
-            encoder_output = encoder_output.index_select(0, beam_idx_tensor)
-            if src_attention_mask is not None:
-                src_attention_mask = src_attention_mask.index_select(0, beam_idx_tensor)
+            # ``encoder_output`` and ``src_attention_mask`` are already duplicated
+            # per-beam and are identical across beams within a batch (they only
+            # depend on the source sentence). Reordering by ``beam_idx_tensor``
+            # produces a tensor with the same values but forces a new allocation
+            # every step, so we skip it entirely and only reorder the decoder
+            # KV caches, which actually track per-beam history.
             past_key_values = _reorder_past_key_values(past_key_values, beam_idx_tensor)
 
-            # Early stopping
-            if beam_scorer.done.all().item():
+            # Early stopping. ``done_cpu`` already reflects the start-of-step
+            # state; we augment it with the updates queued this step to avoid
+            # an extra CPU-GPU sync on ``beam_scorer.done``.
+            for bi in done_updates:
+                done_cpu[bi] = True
+            if all(done_cpu):
                 logger.info(f"Beam search early stopping at step {step + 1}")
                 break
         

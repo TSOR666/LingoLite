@@ -1,0 +1,16 @@
+{
+  "vocab_size": 39,
+  "model_size": "tiny",
+  "d_model": 64,
+  "n_encoder_layers": 2,
+  "n_decoder_layers": 2,
+  "n_heads": 4,
+  "n_kv_heads": 2,
+  "d_ff": 128,
+  "max_seq_len": 32,
+  "pad_token_id": 0,
+  "first_loss": 3.7202653884887695,
+  "final_loss": 0.13197366893291473,
+  "steps": 106,
+  "data_path": "examples\\data\\tiny_smoke_dataset.json"
+}

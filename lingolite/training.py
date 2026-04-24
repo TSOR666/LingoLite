@@ -10,10 +10,12 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, cast
 
+import math
+
 import numpy as np
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import LambdaLR, OneCycleLR
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm  # type: ignore[import-untyped]
 
@@ -187,7 +189,7 @@ class TranslationTrainer:
     """
     Trainer for translation model.
     """
-    
+
     def __init__(
         self,
         model: MobileTranslationModel,
@@ -201,6 +203,8 @@ class TranslationTrainer:
         label_smoothing: float = 0.1,
         device: str = 'cuda',
         save_dir: str = './checkpoints',
+        amp_dtype: Optional[str] = None,
+        compile_model: bool = False,
     ):
         """
         Args:
@@ -215,6 +219,12 @@ class TranslationTrainer:
             label_smoothing: Label smoothing factor
             device: Device to train on
             save_dir: Directory to save checkpoints
+            amp_dtype: Optional autocast dtype ("fp16", "bf16", or None).
+                On CUDA, fp16 enables GradScaler-backed mixed precision for
+                ~2x throughput; bf16 skips GradScaler (no under/overflow) and
+                needs an Ampere+ GPU. On CPU, bf16 is the only viable choice.
+            compile_model: When True, wrap the model in ``torch.compile`` for
+                kernel fusion. Falls back gracefully if compile is unavailable.
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -222,6 +232,40 @@ class TranslationTrainer:
         self.device = device
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Parse AMP configuration.
+        amp_dtype_map: Dict[str, torch.dtype] = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+        self.amp_dtype: Optional[torch.dtype] = None
+        if amp_dtype is not None:
+            key = amp_dtype.lower()
+            if key not in amp_dtype_map:
+                raise ValueError(
+                    f"amp_dtype must be one of {list(amp_dtype_map)} or None, got {amp_dtype!r}"
+                )
+            self.amp_dtype = amp_dtype_map[key]
+            if self.amp_dtype is torch.float16 and device != "cuda":
+                raise ValueError("amp_dtype='fp16' requires CUDA; use 'bf16' on CPU.")
+
+        # GradScaler is only needed for fp16 (bf16 has the same dynamic range
+        # as fp32 and doesn't under/overflow).
+        self._amp_device = "cuda" if str(device).startswith("cuda") else "cpu"
+        self._use_grad_scaler = self.amp_dtype is torch.float16
+        if self._use_grad_scaler:
+            self.scaler = torch.amp.GradScaler(self._amp_device)
+        else:
+            self.scaler = None  # type: ignore[assignment]
+
+        # Optional torch.compile wrapping (opt-in; not all torch builds ship
+        # with Inductor). We intentionally compile the module and let
+        # compute_loss dispatch through it.
+        if compile_model:
+            try:
+                self.model = torch.compile(self.model)  # type: ignore[assignment]
+            except Exception as exc:
+                logger.warning("torch.compile unavailable, continuing uncompiled: %s", exc)
 
         # Validate max_steps
         if max_steps <= 0:
@@ -273,14 +317,39 @@ class TranslationTrainer:
                 max_warmup_steps,
                 self.warmup_steps,
             )
-        pct_start = min(max(float(self.warmup_steps) / float(max_steps), 0.0), 1.0)
-        self.scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=learning_rate,
-            total_steps=max_steps,
-            pct_start=pct_start,
-            anneal_strategy='cos',
-        )
+
+        # OneCycleLR with a very short ``total_steps`` and a large
+        # ``final_div_factor`` collapses the LR to ~1e-9 within a handful of
+        # steps (e.g. smoke tests). Fall back to a linear-warmup + cosine-decay
+        # schedule when ``max_steps`` is too small for OneCycleLR to behave
+        # reasonably (heuristic: need at least ~20 post-warmup decay steps).
+        post_warmup_steps = max_steps - self.warmup_steps
+        if post_warmup_steps < 20:
+            warmup = max(self.warmup_steps, 1)
+            total = max(max_steps, 1)
+
+            def lr_lambda(step: int) -> float:
+                if step < warmup:
+                    return float(step + 1) / float(warmup)
+                progress = float(step - warmup) / float(max(1, total - warmup))
+                return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+            logger.info(
+                "Using LinearWarmup+CosineDecay fallback (max_steps=%d too small "
+                "for OneCycleLR; need >=20 post-warmup steps, got %d)",
+                max_steps,
+                post_warmup_steps,
+            )
+        else:
+            pct_start = min(max(float(self.warmup_steps) / float(max_steps), 0.0), 1.0)
+            self.scheduler = OneCycleLR(
+                self.optimizer,
+                max_lr=learning_rate,
+                total_steps=max_steps,
+                pct_start=pct_start,
+                anneal_strategy='cos',
+            )
 
         self.gradient_clip = gradient_clip
         self.label_smoothing = label_smoothing
@@ -291,10 +360,10 @@ class TranslationTrainer:
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, float]]:
         """
         Single training step.
-        
+
         Args:
             batch: Batch of data
-        
+
         Returns:
             loss: Training loss
             metrics: Dictionary of metrics
@@ -302,35 +371,52 @@ class TranslationTrainer:
         # Handle empty batch
         if batch['src_input_ids'].numel() == 0:
             return 0.0, {'loss': 0.0, 'grad_norm': 0.0, 'lr': 0.0}
-        
+
         self.model.train()
-        
+
         # Move batch to device
         batch = {k: v.to(self.device) for k, v in batch.items()}
-        
-        # Forward pass
-        loss: torch.Tensor = self.model.compute_loss(
-            src_input_ids=batch['src_input_ids'],
-            tgt_input_ids=batch['tgt_input_ids'],
-            src_attention_mask=batch['src_attention_mask'],
-            tgt_attention_mask=batch['tgt_attention_mask'],
-            label_smoothing=self.label_smoothing,
-        )
-        
-        # Backward pass
+
+        # Forward pass (optionally under autocast for mixed precision).
         self.optimizer.zero_grad()
-        loss.backward()  # type: ignore[no-untyped-call]
-        
-        # Gradient clipping (L2 norm)
-        # Prevents exploding gradients by scaling gradient vector such that ||∇||₂ ≤ max_norm
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            max_norm=self.gradient_clip,
-            norm_type=2.0,  # L2 norm (Euclidean)
-        )
-        
-        # Optimizer step
-        self.optimizer.step()
+        if self.amp_dtype is not None:
+            with torch.autocast(device_type=self._amp_device, dtype=self.amp_dtype):
+                loss: torch.Tensor = self.model.compute_loss(
+                    src_input_ids=batch['src_input_ids'],
+                    tgt_input_ids=batch['tgt_input_ids'],
+                    src_attention_mask=batch['src_attention_mask'],
+                    tgt_attention_mask=batch['tgt_attention_mask'],
+                    label_smoothing=self.label_smoothing,
+                )
+        else:
+            loss = self.model.compute_loss(
+                src_input_ids=batch['src_input_ids'],
+                tgt_input_ids=batch['tgt_input_ids'],
+                src_attention_mask=batch['src_attention_mask'],
+                tgt_attention_mask=batch['tgt_attention_mask'],
+                label_smoothing=self.label_smoothing,
+            )
+
+        # Backward pass (scaled for fp16 to avoid underflow).
+        if self._use_grad_scaler and self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=self.gradient_clip,
+                norm_type=2.0,
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()  # type: ignore[no-untyped-call]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=self.gradient_clip,
+                norm_type=2.0,
+            )
+            self.optimizer.step()
+
         self.scheduler.step()
         
         self.global_step += 1
@@ -573,6 +659,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
 
+    # Mixed precision & compile
+    parser.add_argument('--amp-dtype', type=str, default=None,
+                        choices=['fp16', 'bf16'],
+                        help='Enable autocast mixed precision. fp16 requires CUDA; bf16 works on Ampere+ CUDA or CPU')
+    parser.add_argument('--compile', dest='compile_model', action='store_true',
+                        help='Wrap the model in torch.compile for kernel fusion')
+
     return parser
 
 
@@ -687,6 +780,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         label_smoothing=args.label_smoothing,
         device=device,
         save_dir=args.save_dir,
+        amp_dtype=args.amp_dtype,
+        compile_model=args.compile_model,
     )
     print("[OK] Trainer ready")
 

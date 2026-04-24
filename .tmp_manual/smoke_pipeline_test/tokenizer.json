@@ -1,0 +1,39 @@
+{
+  "word_to_id": {
+    "hello": 12,
+    "hola": 13,
+    "good": 14,
+    "morning": 15,
+    "buenos": 16,
+    "dias": 17,
+    "thank": 18,
+    "you": 19,
+    "gracias": 20,
+    "goodbye": 21,
+    "adios": 22,
+    "please": 23,
+    "por": 24,
+    "favor": 25,
+    "i": 26,
+    "love": 27,
+    "te": 28,
+    "quiero": 29,
+    "see": 30,
+    "soon": 31,
+    "hasta": 32,
+    "pronto": 33,
+    "how": 34,
+    "are": 35,
+    "you?": 36,
+    "como": 37,
+    "estas?": 38
+  },
+  "languages": [
+    "en",
+    "es",
+    "fr",
+    "de",
+    "it",
+    "da"
+  ]
+}
