@@ -214,33 +214,43 @@ class TranslationTokenizer:
         token_ids = cast(List[int], sp_model.encode_as_ids(text))
 
         if add_special_tokens:
-            tokens = []
-
             if bool(src_lang) ^ bool(tgt_lang):
                 raise ValueError("Either both 'src_lang' and 'tgt_lang' must be provided together, or neither should be provided.")
 
-            # Translation format: <src> <lang> text </s> <tgt> <lang>
+            # Translation format: <src> <lang> text </s> <tgt> <lang>.
+            # Preserve the control-token suffix under truncation; dropping
+            # <tgt>/<lang> silently removes the requested target language.
             if src_lang and tgt_lang:
                 self._validate_language(src_lang, 'source')
                 self._validate_language(tgt_lang, 'target')
-                tokens.extend([
+                prefix = [
                     self.token_to_id[self.src_token],
-                    self.token_to_id[f"<{src_lang}>"]
-                ])
-                tokens.extend(token_ids)
-                tokens.extend([
+                    self.token_to_id[f"<{src_lang}>"],
+                ]
+                suffix = [
                     self.token_to_id[self.eos_token],
                     self.token_to_id[self.tgt_token],
-                    self.token_to_id[f"<{tgt_lang}>"]
-                ])
+                    self.token_to_id[f"<{tgt_lang}>"],
+                ]
+                if max_length is not None:
+                    min_required = len(prefix) + len(suffix)
+                    if max_length < min_required:
+                        raise ValueError(
+                            f"max_length must be at least {min_required} for translation-format encoding, got {max_length}"
+                        )
+                    token_ids = token_ids[: max_length - min_required]
+                token_ids = prefix + token_ids + suffix
             else:
                 # Standard format: <s> text </s>
-                tokens = [self.token_to_id[self.sos_token]] + token_ids + [self.token_to_id[self.eos_token]]
-            
-            token_ids = tokens
-        
-        # Truncate if needed
-        if max_length is not None and len(token_ids) > max_length:
+                if max_length is not None:
+                    min_required = 2
+                    if max_length < min_required:
+                        raise ValueError(
+                            f"max_length must be at least {min_required} when add_special_tokens=True, got {max_length}"
+                        )
+                    token_ids = token_ids[: max_length - min_required]
+                token_ids = [self.token_to_id[self.sos_token]] + token_ids + [self.token_to_id[self.eos_token]]
+        elif max_length is not None and len(token_ids) > max_length:
             token_ids = token_ids[:max_length]
         
         return token_ids

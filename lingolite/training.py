@@ -72,19 +72,24 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
             max_length=self.max_length,
         )
 
-        # Tokenize target (format: <tgt_lang> text </s>)
+        # Tokenize target (format: <s> text </s>). The source sequence already
+        # carries the requested target language as <tgt> <lang>, and generation
+        # starts from sos_token_id, so training must use the same decoder start.
         tgt_text = item['tgt_text']
+        target_body_max_length = max(0, self.max_length - 2)
         tgt_ids = self.tokenizer.encode(
             text=tgt_text,
             add_special_tokens=False,
-            max_length=self.max_length,
+            max_length=target_body_max_length,
         )
         
-        # Add language token and EOS
+        # Add SOS and EOS while respecting max_length.
         if item['tgt_lang'] not in self.tokenizer.languages:
             raise ValueError(f"Target language '{item['tgt_lang']}' not supported. Supported: {self.tokenizer.languages}")
-        tgt_lang_id = self.tokenizer.token_to_id[f"<{item['tgt_lang']}>"]
-        tgt_ids = [tgt_lang_id] + tgt_ids + [self.tokenizer.eos_token_id]
+        sos_token_id = getattr(self.tokenizer, 'sos_token_id', self.tokenizer.token_to_id.get('<s>'))
+        if sos_token_id is None:
+            raise ValueError("Tokenizer must expose sos_token_id or token_to_id['<s>']")
+        tgt_ids = [int(sos_token_id)] + tgt_ids + [self.tokenizer.eos_token_id]
         
         src_mask = [1] * len(src_ids)
         tgt_mask = [1] * len(tgt_ids)
@@ -205,6 +210,8 @@ class TranslationTrainer:
         save_dir: str = './checkpoints',
         amp_dtype: Optional[str] = None,
         compile_model: bool = False,
+        gradient_accumulation_steps: int = 1,
+        gradient_checkpointing: bool = False,
     ):
         """
         Args:
@@ -225,6 +232,17 @@ class TranslationTrainer:
                 needs an Ampere+ GPU. On CPU, bf16 is the only viable choice.
             compile_model: When True, wrap the model in ``torch.compile`` for
                 kernel fusion. Falls back gracefully if compile is unavailable.
+            gradient_accumulation_steps: Average gradients over this many
+                micro-batches before stepping the optimizer. Effective batch
+                size becomes ``train_batch_size * gradient_accumulation_steps``
+                without extra peak memory. ``global_step`` advances per
+                optimizer step, not per micro-batch, so eval/save cadence is
+                unchanged. Defaults to 1 (no accumulation).
+            gradient_checkpointing: When True, recompute encoder/decoder layer
+                activations during backward instead of caching them. Trades
+                ~30% extra compute for substantially lower training-time
+                activation memory. Only active when ``model.training`` is True
+                so inference paths (greedy/beam) are unaffected.
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -354,6 +372,30 @@ class TranslationTrainer:
         self.gradient_clip = gradient_clip
         self.label_smoothing = label_smoothing
 
+        if gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, got {gradient_accumulation_steps}"
+            )
+        self.gradient_accumulation_steps = int(gradient_accumulation_steps)
+        # Counts micro-batches consumed within the current accumulation cycle.
+        # An optimizer step (and global_step increment) fires when this hits
+        # ``gradient_accumulation_steps``.
+        self._micro_step_in_cycle = 0
+
+        # Optionally enable activation checkpointing on the wrapped model.
+        # The encoder/decoder check ``self.training`` internally, so this is a
+        # no-op for eval / generate paths even when the flag is on.
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        if self.gradient_checkpointing:
+            enable = getattr(self.model, "gradient_checkpointing_enable", None)
+            if callable(enable):
+                enable()
+            else:
+                logger.warning(
+                    "gradient_checkpointing=True but model has no "
+                    "gradient_checkpointing_enable(); ignoring."
+                )
+
         self.global_step = 0
         self.best_val_loss = float('inf')
         
@@ -361,11 +403,18 @@ class TranslationTrainer:
         """
         Single training step.
 
+        With ``gradient_accumulation_steps > 1`` this runs a *micro-step*: the
+        loss is scaled by ``1/N``, ``backward()`` accumulates gradients into
+        the existing buffers, and the optimizer/scheduler/scaler only fire on
+        the Nth micro-step. ``global_step`` advances per optimizer step, so
+        callers reading ``self.global_step`` see the same cadence as before
+        regardless of the accumulation factor.
+
         Args:
             batch: Batch of data
 
         Returns:
-            loss: Training loss
+            loss: Per-micro-batch loss (unscaled, for logging)
             metrics: Dictionary of metrics
         """
         # Handle empty batch
@@ -377,8 +426,16 @@ class TranslationTrainer:
         # Move batch to device
         batch = {k: v.to(self.device) for k, v in batch.items()}
 
+        accum = self.gradient_accumulation_steps
+        is_first_micro = self._micro_step_in_cycle == 0
+        is_last_micro = self._micro_step_in_cycle == accum - 1
+
+        # Only zero gradients at the start of a new accumulation cycle so
+        # intermediate micro-steps add to the running gradient buffers.
+        if is_first_micro:
+            self.optimizer.zero_grad()
+
         # Forward pass (optionally under autocast for mixed precision).
-        self.optimizer.zero_grad()
         if self.amp_dtype is not None:
             with torch.autocast(device_type=self._amp_device, dtype=self.amp_dtype):
                 loss: torch.Tensor = self.model.compute_loss(
@@ -397,36 +454,51 @@ class TranslationTrainer:
                 label_smoothing=self.label_smoothing,
             )
 
+        # Scale the loss so summed gradients across the cycle equal the mean
+        # gradient of the equivalent large batch. Skip the divide when accum=1
+        # to avoid an unnecessary op on the hot path.
+        loss_for_backward = loss if accum == 1 else loss / accum
+
         # Backward pass (scaled for fp16 to avoid underflow).
         if self._use_grad_scaler and self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                max_norm=self.gradient_clip,
-                norm_type=2.0,
-            )
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.scaler.scale(loss_for_backward).backward()
+            if is_last_micro:
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=self.gradient_clip,
+                    norm_type=2.0,
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # Mid-cycle: gradients keep accumulating, no clip / step yet.
+                grad_norm = torch.zeros((), device=self.device)
         else:
-            loss.backward()  # type: ignore[no-untyped-call]
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                max_norm=self.gradient_clip,
-                norm_type=2.0,
-            )
-            self.optimizer.step()
+            loss_for_backward.backward()  # type: ignore[no-untyped-call]
+            if is_last_micro:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=self.gradient_clip,
+                    norm_type=2.0,
+                )
+                self.optimizer.step()
+            else:
+                grad_norm = torch.zeros((), device=self.device)
 
-        self.scheduler.step()
-        
-        self.global_step += 1
-        
+        if is_last_micro:
+            self.scheduler.step()
+            self.global_step += 1
+            self._micro_step_in_cycle = 0
+        else:
+            self._micro_step_in_cycle += 1
+
         metrics = {
             'loss': loss.item(),
             'grad_norm': grad_norm.item(),
             'lr': self.scheduler.get_last_lr()[0],
         }
-        
+
         return loss.item(), metrics
     
     @torch.no_grad()
@@ -439,38 +511,46 @@ class TranslationTrainer:
         """
         if self.val_loader is None:
             return {}
-        
+
         self.model.eval()
-        
-        total_loss = 0
-        total_tokens = 0
-        
-        for batch in tqdm(self.val_loader, desc="Validation"):
-            # Skip empty batches
-            if batch['src_input_ids'].numel() == 0:
-                continue
-                
-            # Move batch to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            # Compute loss
-            loss = self.model.compute_loss(
-                src_input_ids=batch['src_input_ids'],
-                tgt_input_ids=batch['tgt_input_ids'],
-                src_attention_mask=batch['src_attention_mask'],
-                tgt_attention_mask=batch['tgt_attention_mask'],
-                label_smoothing=0.0,  # No smoothing for validation
-            )
-            
-            # Count non-padding tokens
-            num_tokens = batch['tgt_attention_mask'][:, 1:].sum().item()
-            
-            total_loss += loss.item() * num_tokens
-            total_tokens += num_tokens
-        
-        avg_loss = total_loss / max(1e-8, total_tokens)
+
+        # Accumulate on-device so the eval loop doesn't pay a host sync per
+        # batch. Previously each iteration called ``.item()`` twice (loss and
+        # token count), each one a CUDA->CPU sync that stalled the queue. We
+        # now keep running totals in fp64 device tensors and only sync once
+        # at the very end of the loop.
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
+        total_tokens = torch.zeros((), device=self.device, dtype=torch.float64)
+
+        with torch.inference_mode():
+            for batch in tqdm(self.val_loader, desc="Validation"):
+                # Skip empty batches (numel is a tensor-metadata read, no sync).
+                if batch['src_input_ids'].numel() == 0:
+                    continue
+
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                loss = self.model.compute_loss(
+                    src_input_ids=batch['src_input_ids'],
+                    tgt_input_ids=batch['tgt_input_ids'],
+                    src_attention_mask=batch['src_attention_mask'],
+                    tgt_attention_mask=batch['tgt_attention_mask'],
+                    label_smoothing=0.0,  # No smoothing for validation
+                )
+
+                # ``compute_loss`` returns the mean over non-pad target tokens,
+                # so weighting by num_tokens recovers the per-batch sum.
+                num_tokens = batch['tgt_attention_mask'][:, 1:].sum()
+                total_loss = total_loss + loss.detach().to(torch.float64) * num_tokens.to(torch.float64)
+                total_tokens = total_tokens + num_tokens.to(torch.float64)
+
+        # Single host sync at the end.
+        total_loss_value = float(total_loss.item())
+        total_tokens_value = float(total_tokens.item())
+
+        avg_loss = total_loss_value / max(1e-8, total_tokens_value)
         perplexity = float(np.exp(avg_loss))
-        
+
         return {
             'val_loss': avg_loss,
             'perplexity': perplexity,
@@ -623,6 +703,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Training arguments
     parser.add_argument('--batch-size', type=int, default=32,
                         help='Training batch size')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='DataLoader worker processes for train/validation loading')
+    parser.add_argument('--pin-memory', action='store_true',
+                        help='Enable DataLoader pin_memory for faster CPU-to-CUDA transfers')
+    parser.add_argument('--persistent-workers', action='store_true',
+                        help='Keep DataLoader workers alive between epochs (requires --num-workers > 0)')
+    parser.add_argument('--prefetch-factor', type=int, default=2,
+                        help='DataLoader prefetch factor when --num-workers > 0')
     parser.add_argument('--max-length', type=int, default=128,
                         help='Maximum sequence length')
     parser.add_argument('--num-epochs', type=int, default=10,
@@ -718,6 +806,24 @@ def main(argv: Optional[List[str]] = None) -> None:
         train_data = json.load(f)
     logger.info(f"Loaded {len(train_data)} training examples")
 
+    if args.num_workers < 0:
+        logger.error(f"num_workers must be non-negative, got {args.num_workers}")
+        sys.exit(1)
+    if args.prefetch_factor <= 0:
+        logger.error(f"prefetch_factor must be positive, got {args.prefetch_factor}")
+        sys.exit(1)
+    if args.persistent_workers and args.num_workers == 0:
+        logger.error("--persistent-workers requires --num-workers > 0")
+        sys.exit(1)
+
+    dataloader_kwargs = {
+        'num_workers': args.num_workers,
+        'pin_memory': bool(args.pin_memory),
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs['persistent_workers'] = bool(args.persistent_workers)
+        dataloader_kwargs['prefetch_factor'] = args.prefetch_factor
+
     # Load validation data
     val_loader = None
     if args.val_data:
@@ -734,6 +840,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 batch_size=args.batch_size,
                 shuffle=False,
                 collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+                **dataloader_kwargs,
             ),
         )
 
@@ -747,6 +854,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+            **dataloader_kwargs,
         ),
     )
     print(f"[OK] Train loader: {len(train_loader)} batches")

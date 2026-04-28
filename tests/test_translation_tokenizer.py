@@ -134,6 +134,35 @@ class TestTranslationTokenizerEncoding:
         
         assert len(result) == 3
 
+    def test_translation_truncation_preserves_target_language_suffix(
+        self, mock_tokenizer: "TranslationTokenizer"
+    ) -> None:
+        """Translation-format truncation should keep </s> <tgt> <lang> controls."""
+        mock_tokenizer.sp_model.encode_as_ids.return_value = [100, 101, 102, 103, 104]
+
+        result = mock_tokenizer.encode(
+            "long input",
+            src_lang='en',
+            tgt_lang='es',
+            add_special_tokens=True,
+            max_length=6,
+        )
+
+        assert result == [4, 6, 100, 2, 5, 7]
+
+    def test_translation_format_rejects_too_short_max_length(
+        self, mock_tokenizer: "TranslationTokenizer"
+    ) -> None:
+        """Translation-format encoding needs room for source and target controls."""
+        with pytest.raises(ValueError, match="max_length must be at least 5"):
+            mock_tokenizer.encode(
+                "hello",
+                src_lang='en',
+                tgt_lang='es',
+                add_special_tokens=True,
+                max_length=4,
+            )
+
     def test_decode_with_skip_special_tokens(self, mock_tokenizer: "TranslationTokenizer") -> None:
         """Decode should skip special tokens when requested."""
         # Token IDs that include special tokens

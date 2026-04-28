@@ -90,7 +90,7 @@ def translate_batch(
     model.eval()
     translations = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in tqdm(range(0, len(source_sentences), batch_size), desc="Translating"):
             batch = source_sentences[i:i + batch_size]
 
