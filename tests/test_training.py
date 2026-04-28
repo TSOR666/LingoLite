@@ -115,6 +115,33 @@ class TestTranslationDataset:
         assert 'src_attention_mask' in item
         assert 'tgt_attention_mask' in item
 
+    def test_dataset_target_uses_sos_and_respects_max_length(
+        self, sample_data: List[Dict[str, str]], mock_tokenizer: MockTokenizer
+    ) -> None:
+        """Training target format should match generation's decoder start token."""
+
+        class LongTargetTokenizer(MockTokenizer):
+            def encode(
+                self,
+                text: str,
+                src_lang: str = None,
+                tgt_lang: str = None,
+                add_special_tokens: bool = True,
+                max_length: int = 128,
+            ) -> List[int]:
+                if not add_special_tokens:
+                    return list(range(10, 10 + max_length + 10))[:max_length]
+                return super().encode(text, src_lang, tgt_lang, add_special_tokens, max_length)
+
+        tokenizer = LongTargetTokenizer()
+        dataset = TranslationDataset(sample_data, tokenizer, max_length=5)
+        item = dataset[0]
+
+        assert item['tgt_input_ids'][0] == tokenizer.sos_token_id
+        assert item['tgt_input_ids'][-1] == tokenizer.eos_token_id
+        assert len(item['tgt_input_ids']) == 5
+        assert 7 not in item['tgt_input_ids']
+
     def test_dataset_indexing(
         self, sample_data: List[Dict[str, str]], mock_tokenizer: MockTokenizer
     ) -> None:

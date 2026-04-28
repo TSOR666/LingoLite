@@ -284,7 +284,7 @@ async def translate(request: TranslationRequest) -> TranslationResponse:
     )
     input_tensor = torch.tensor([input_ids], device=device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         if request.method == "beam" and hasattr(model, "generate_beam"):
             output_ids = model.generate_beam(
                 src_input_ids=input_tensor,

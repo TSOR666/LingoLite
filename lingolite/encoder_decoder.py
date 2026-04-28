@@ -253,12 +253,18 @@ class TransformerEncoder(nn.Module):
         ]
         self.layers = nn.ModuleList(layers)
         self._encoder_layers: List[EncoderLayer] = layers
-        
+
         # Final normalization
         self.final_norm = RMSNorm(d_model)
-        
+
         self.dropout = nn.Dropout(dropout)
-        
+
+        # Off by default; toggled via ``gradient_checkpointing_enable()`` from
+        # the trainer. When True and the module is in training mode, each
+        # encoder layer's forward is recomputed during backward instead of
+        # caching activations.
+        self.gradient_checkpointing: bool = False
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -284,9 +290,20 @@ class TransformerEncoder(nn.Module):
             # Convert to (batch, 1, 1, seq_len) for broadcasting
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         
-        # Apply encoder layers
-        for layer in self._encoder_layers:
-            x = layer(x, attention_mask=attention_mask, rope=self.rope)
+        # Apply encoder layers, optionally under activation checkpointing.
+        use_ckpt = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        if use_ckpt:
+            from torch.utils.checkpoint import checkpoint
+            for layer in self._encoder_layers:
+                x = checkpoint(
+                    layer, x,
+                    attention_mask=attention_mask,
+                    rope=self.rope,
+                    use_reentrant=False,
+                )
+        else:
+            for layer in self._encoder_layers:
+                x = layer(x, attention_mask=attention_mask, rope=self.rope)
         
         # Final normalization
         x = self.final_norm(x)
@@ -340,19 +357,23 @@ class TransformerDecoder(nn.Module):
         ]
         self.layers = nn.ModuleList(layers)
         self._decoder_layers: List[DecoderLayer] = layers
-        
+
         # Final normalization
         self.final_norm = RMSNorm(d_model)
-        
+
         # Output projection
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        
+
         # Weight tying (share embeddings with output)
         if tie_embeddings:
             self.lm_head.weight = self.embedding.weight
-        
+
         self.dropout = nn.Dropout(dropout)
-        
+
+        # Off by default; only fires when training and ``use_cache=False``
+        # (the KV-cache mutation pattern doesn't survive checkpoint's recompute).
+        self.gradient_checkpointing: bool = False
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -405,18 +426,44 @@ class TransformerDecoder(nn.Module):
         # Initialize caches list if needed
         updated_caches: Optional[List['LayerKVCache']] = [] if use_cache else None
 
-        # Apply decoder layers
+        # Apply decoder layers, optionally under activation checkpointing.
+        # Only enabled when training without a KV cache - the cache mutation
+        # pattern (in-place buffer writes) doesn't survive checkpoint's
+        # forward-recompute during backward, so we skip checkpointing on the
+        # generate path even if the flag is set.
+        use_ckpt = (
+            self.gradient_checkpointing
+            and self.training
+            and not use_cache
+            and torch.is_grad_enabled()
+        )
+
+        if use_ckpt:
+            from torch.utils.checkpoint import checkpoint
+
         for i, layer in enumerate(self._decoder_layers):
             layer_cache = past_key_values[i] if past_key_values else None
-            x, new_cache = layer(
-                x,
-                encoder_output=encoder_output,
-                self_attention_mask=self_attention_mask,
-                cross_attention_mask=cross_attention_mask,
-                rope=self.rope,
-                layer_cache=layer_cache,
-                use_cache=use_cache,
-            )
+            if use_ckpt:
+                x, new_cache = checkpoint(
+                    layer, x,
+                    encoder_output=encoder_output,
+                    self_attention_mask=self_attention_mask,
+                    cross_attention_mask=cross_attention_mask,
+                    rope=self.rope,
+                    layer_cache=layer_cache,
+                    use_cache=use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                x, new_cache = layer(
+                    x,
+                    encoder_output=encoder_output,
+                    self_attention_mask=self_attention_mask,
+                    cross_attention_mask=cross_attention_mask,
+                    rope=self.rope,
+                    layer_cache=layer_cache,
+                    use_cache=use_cache,
+                )
 
             if use_cache and updated_caches is not None:
                 if new_cache is None:

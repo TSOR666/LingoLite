@@ -96,6 +96,22 @@ class MobileTranslationModel(nn.Module):
         if tie_embeddings:
             self.decoder.lm_head.weight = self.decoder.embedding.weight
         
+    def gradient_checkpointing_enable(self) -> None:
+        """Turn on activation checkpointing for encoder + decoder layers.
+
+        Reduces training-time activation memory at the cost of one extra
+        forward per layer during backward. Only takes effect when the module
+        is in training mode and ``use_cache`` is False, so inference paths
+        (greedy/beam decoding) remain unaffected.
+        """
+        self.encoder.gradient_checkpointing = True
+        self.decoder.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Turn off activation checkpointing."""
+        self.encoder.gradient_checkpointing = False
+        self.decoder.gradient_checkpointing = False
+
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights with appropriate distributions."""
         if isinstance(module, nn.Linear):
