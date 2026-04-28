@@ -1,0 +1,78 @@
+Hello
+Hola
+Good morning
+Buenos dias
+How are you?
+Como estas?
+Thank you
+Gracias
+Please
+Por favor
+Goodbye
+Adios
+Good night
+Buenas noches
+See you soon
+Hasta pronto
+I love you
+Te quiero
+Yes
+Si
+No
+No
+What is your name?
+Como te llamas?
+Hola
+Hello
+Buenos dias
+Good morning
+Gracias
+Thank you
+Adios
+Goodbye
+Hello
+Bonjour
+Good morning
+Bonjour
+Thank you
+Merci
+Goodbye
+Au revoir
+Please
+Sil vous plait
+Yes
+Oui
+No
+Non
+Hello
+Hallo
+Thank you
+Danke
+Good morning
+Guten Morgen
+Goodbye
+Auf Wiedersehen
+Yes
+Ja
+No
+Nein
+Hello
+Ciao
+Thank you
+Grazie
+Goodbye
+Arrivederci
+Yes
+Si
+No
+No
+Hello
+Hej
+Thank you
+Tak
+Goodbye
+Farvel
+Yes
+Ja
+No
+Nej

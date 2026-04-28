@@ -11,6 +11,11 @@ For each scenario we report wall-clock latency (mean, p50, p95), throughput
 before timed iterations so JIT/cudnn/allocator effects don't pollute the
 first sample.
 
+With ``--variants``, each scenario is run across multiple model variants
+(e.g. fp32 vs int8 dynamic quantization) and the matrix is reported in a
+single table along with the model's serialized size. ``train_step`` is
+silently skipped for variants that don't support training (int8).
+
 The script does **not** require a trained checkpoint; weights are randomly
 initialized via ``create_model``. The goal is to measure the implementation's
 performance characteristics, not translation quality.
@@ -22,6 +27,9 @@ Usage examples:
 
     # Just greedy decoding on a tiny model with a longer decode budget
     python scripts/benchmark.py --model-size tiny --scenarios greedy --max-length 64
+
+    # Compare fp32 vs int8 dynamic quantization for inference latency + size
+    python scripts/benchmark.py --variants fp32 int8 --scenarios greedy beam
 
     # JSON output for machine consumption / regression tracking
     python scripts/benchmark.py --json
@@ -44,6 +52,10 @@ from lingolite.mobile_translation_model import MobileTranslationModel, create_mo
 
 
 SCENARIOS = ("train_step", "greedy", "beam")
+VARIANTS = ("fp32", "fp16", "bf16", "int8")
+# int8 (dynamic quantization) replaces nn.Linear modules in-place with custom
+# eager-mode wrappers; gradients aren't supported, so train_step is skipped.
+INFERENCE_ONLY_VARIANTS = {"int8"}
 
 
 @dataclass
@@ -57,6 +69,8 @@ class ScenarioResult:
     max_ms: float
     tokens_per_sec: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+    variant: str = "fp32"
+    model_size_mb: Optional[float] = None
     notes: List[str] = field(default_factory=list)
 
 
@@ -128,6 +142,8 @@ def _summarize(
     *,
     tokens_per_call: Optional[int],
     peak_memory_mb: Optional[float],
+    variant: str = "fp32",
+    model_size_mb: Optional[float] = None,
     notes: Optional[List[str]] = None,
 ) -> ScenarioResult:
     timings_ms = [t * 1000.0 for t in timings_s]
@@ -152,8 +168,23 @@ def _summarize(
         max_ms=max(timings_ms),
         tokens_per_sec=tps,
         peak_memory_mb=peak_memory_mb,
+        variant=variant,
+        model_size_mb=model_size_mb,
         notes=list(notes or []),
     )
+
+
+def _measure_model_size_mb(model: torch.nn.Module) -> float:
+    """Serialize the state dict to a buffer and report its size in MiB.
+
+    This is the size of the saved checkpoint, which is the most concrete
+    proxy for "deployment payload" we can measure without writing to disk.
+    """
+    import io
+
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    return buf.tell() / (1024 ** 2)
 
 
 def _make_random_batch(
@@ -198,9 +229,32 @@ def _build_model(
     model_size: str,
     vocab_size: int,
     device: torch.device,
-    dtype: torch.dtype,
+    variant: str,
 ) -> MobileTranslationModel:
+    """Construct a model in the requested numerical variant.
+
+    ``fp32``/``fp16``/``bf16`` cast the freshly-initialised model to the
+    requested dtype. ``int8`` runs dynamic quantization via the project's
+    quantization utilities (which fall back to a custom eager INT8 wrapper
+    when ``torchao`` is unavailable).
+    """
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}; expected one of {VARIANTS}")
+
     model = create_model(vocab_size=vocab_size, model_size=model_size)
+
+    if variant == "int8":
+        # Dynamic quantization expects fp32 weights; quantize first, then move
+        # to the requested device.
+        from lingolite.quantization_utils import apply_dynamic_quantization
+
+        model = apply_dynamic_quantization(model, dtype=torch.qint8)
+        model = model.to(device=device)
+        return model
+
+    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[variant]
+    if device.type == "cpu" and dtype == torch.float16:
+        raise ValueError("fp16 on CPU is not supported; use bf16 or fp32")
     model = model.to(device=device, dtype=dtype)
     return model
 
@@ -223,6 +277,8 @@ def _bench_train_step(
     warmup: int,
     iters: int,
     seed: int,
+    variant: str = "fp32",
+    model_size_mb: Optional[float] = None,
 ) -> ScenarioResult:
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -265,6 +321,8 @@ def _bench_train_step(
         timings_s,
         tokens_per_call=target_tokens_per_call,
         peak_memory_mb=peak(),
+        variant=variant,
+        model_size_mb=model_size_mb,
         notes=notes,
     )
 
@@ -285,6 +343,8 @@ def _bench_decode(
     iters: int,
     seed: int,
     num_beams: int,
+    variant: str = "fp32",
+    model_size_mb: Optional[float] = None,
 ) -> ScenarioResult:
     model.eval()
     batch = _make_random_batch(
@@ -338,6 +398,8 @@ def _bench_decode(
         timings_s,
         tokens_per_call=None,  # decode token count varies with EOS; report latency only
         peak_memory_mb=peak(),
+        variant=variant,
+        model_size_mb=model_size_mb,
         notes=notes,
     )
 
@@ -347,10 +409,22 @@ def _bench_decode(
 # ---------------------------------------------------------------------------
 
 def _format_table(results: List[ScenarioResult]) -> str:
-    headers = ["scenario", "iters", "mean ms", "p50 ms", "p95 ms", "tok/s", "peak MB", "notes"]
+    headers = [
+        "variant",
+        "scenario",
+        "iters",
+        "mean ms",
+        "p50 ms",
+        "p95 ms",
+        "tok/s",
+        "peak MB",
+        "model MB",
+        "notes",
+    ]
     rows: List[List[str]] = []
     for r in results:
         rows.append([
+            r.variant,
             r.name,
             str(r.iters),
             f"{r.mean_ms:.2f}",
@@ -358,6 +432,7 @@ def _format_table(results: List[ScenarioResult]) -> str:
             f"{r.p95_ms:.2f}",
             "-" if r.tokens_per_sec is None else f"{r.tokens_per_sec:.1f}",
             "-" if r.peak_memory_mb is None else f"{r.peak_memory_mb:.1f}",
+            "-" if r.model_size_mb is None else f"{r.model_size_mb:.1f}",
             "; ".join(r.notes),
         ])
 
@@ -377,7 +452,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-size", choices=["tiny", "small", "medium", "large"], default="small")
     p.add_argument("--vocab-size", type=int, default=8000)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    p.add_argument(
+        "--variants",
+        nargs="+",
+        choices=list(VARIANTS),
+        default=None,
+        help="Run the matrix across these model variants. If omitted, runs a single variant per --dtype/--int8.",
+    )
+    p.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Single-variant dtype (ignored when --variants is given).",
+    )
+    p.add_argument(
+        "--int8",
+        action="store_true",
+        help="Single-variant shortcut for int8 dynamic quantization (ignored when --variants is given).",
+    )
     p.add_argument(
         "--scenarios",
         nargs="+",
@@ -396,8 +488,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _resolve_dtype(name: str) -> torch.dtype:
-    return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[name]
+def _resolve_variants(args: argparse.Namespace) -> List[str]:
+    """Pick which numerical variants to run.
+
+    Explicit ``--variants`` wins. Otherwise we synthesize a single-variant
+    list from ``--dtype`` / ``--int8`` so the legacy CLI keeps working.
+    """
+    if args.variants:
+        return list(args.variants)
+    if args.int8:
+        return ["int8"]
+    return [{"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}[args.dtype]]
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -405,68 +506,90 @@ def main(argv: Optional[List[str]] = None) -> int:
     torch.manual_seed(args.seed)
 
     device = _resolve_device(args.device)
-    dtype = _resolve_dtype(args.dtype)
-
-    if device.type == "cpu" and dtype == torch.float16:
-        # fp16 matmul is unsupported on most CPUs; bail out clearly instead of
-        # crashing deep inside attention.
-        print("float16 on CPU is not supported; use --dtype bfloat16 or float32", file=sys.stderr)
-        return 2
+    variants = _resolve_variants(args)
 
     pad_id, sos_id, eos_id = 0, 1, 2
-    model = _build_model(
-        model_size=args.model_size,
-        vocab_size=args.vocab_size,
-        device=device,
-        dtype=dtype,
-    )
-    param_count = sum(p.numel() for p in model.parameters())
-
     results: List[ScenarioResult] = []
-    for scenario in args.scenarios:
-        if scenario == "train_step":
-            results.append(
-                _bench_train_step(
-                    model=model,
-                    device=device,
-                    batch_size=args.batch_size,
-                    src_len=args.src_len,
-                    tgt_len=args.tgt_len,
-                    vocab_size=args.vocab_size,
-                    sos_id=sos_id,
-                    eos_id=eos_id,
-                    pad_id=pad_id,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    seed=args.seed,
-                )
-            )
-        else:
-            results.append(
-                _bench_decode(
-                    name=scenario,
-                    model=model,
-                    device=device,
-                    batch_size=args.batch_size,
-                    src_len=args.src_len,
-                    max_length=args.max_length,
-                    vocab_size=args.vocab_size,
-                    sos_id=sos_id,
-                    eos_id=eos_id,
-                    pad_id=pad_id,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    seed=args.seed,
-                    num_beams=args.num_beams,
-                )
-            )
+    param_count: Optional[int] = None
+    variant_sizes: Dict[str, float] = {}
 
-    header_info = {
+    for variant in variants:
+        try:
+            model = _build_model(
+                model_size=args.model_size,
+                vocab_size=args.vocab_size,
+                device=device,
+                variant=variant,
+            )
+        except ValueError as exc:
+            # Surface unsupported combinations (e.g. fp16 on CPU) but keep
+            # going so the rest of the matrix still reports.
+            print(f"[skip] variant={variant}: {exc}", file=sys.stderr)
+            continue
+
+        if param_count is None:
+            param_count = sum(p.numel() for p in model.parameters())
+
+        size_mb = _measure_model_size_mb(model)
+        variant_sizes[variant] = size_mb
+
+        for scenario in args.scenarios:
+            if scenario == "train_step" and variant in INFERENCE_ONLY_VARIANTS:
+                # int8 dynamic quantization replaces nn.Linear with custom
+                # wrappers that don't carry gradients - skip silently.
+                continue
+            if scenario == "train_step":
+                results.append(
+                    _bench_train_step(
+                        model=model,
+                        device=device,
+                        batch_size=args.batch_size,
+                        src_len=args.src_len,
+                        tgt_len=args.tgt_len,
+                        vocab_size=args.vocab_size,
+                        sos_id=sos_id,
+                        eos_id=eos_id,
+                        pad_id=pad_id,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        seed=args.seed,
+                        variant=variant,
+                        model_size_mb=size_mb,
+                    )
+                )
+            else:
+                results.append(
+                    _bench_decode(
+                        name=scenario,
+                        model=model,
+                        device=device,
+                        batch_size=args.batch_size,
+                        src_len=args.src_len,
+                        max_length=args.max_length,
+                        vocab_size=args.vocab_size,
+                        sos_id=sos_id,
+                        eos_id=eos_id,
+                        pad_id=pad_id,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        seed=args.seed,
+                        num_beams=args.num_beams,
+                        variant=variant,
+                        model_size_mb=size_mb,
+                    )
+                )
+
+    if not results:
+        print("No variants produced a result; check --variants and device support", file=sys.stderr)
+        return 2
+
+    header_info: Dict[str, object] = {
         "model_size": args.model_size,
         "vocab_size": args.vocab_size,
         "param_count": param_count,
         "device": str(device),
-        "dtype": args.dtype,
+        "variants": variants,
+        "variant_size_mb": variant_sizes,
         "torch_version": torch.__version__,
         "cuda_device": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
     }
@@ -474,7 +597,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.json:
         print(json.dumps({"config": header_info, "results": [asdict(r) for r in results]}, indent=2))
     else:
-        print(f"Model: {args.model_size} ({param_count:,} params)  device={device}  dtype={args.dtype}")
+        param_label = f"{param_count:,}" if param_count is not None else "?"
+        print(
+            f"Model: {args.model_size} ({param_label} params)  device={device}  "
+            f"variants={','.join(variants)}"
+        )
         if header_info["cuda_device"]:
             print(f"CUDA device: {header_info['cuda_device']}")
         print()

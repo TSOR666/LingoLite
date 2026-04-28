@@ -80,6 +80,99 @@ class DecoderWrapper(nn.Module):
         return cast(torch.Tensor, logits)
 
 
+class CachedDecoderWrapper(nn.Module):
+    """Cache-aware decoder wrapper for efficient autoregressive ONNX inference.
+
+    Unlike :class:`DecoderWrapper`, this version makes each layer's
+    self-attention KV cache an explicit input/output. Runtimes (ONNX Runtime,
+    TFLite, Core ML) can then run one decoder step at a time, feeding the
+    previous step's KV tensors back in instead of re-running the full target
+    prefix every step (O(n) total instead of O(n^2)).
+
+    Tracing semantics:
+
+    * The traced graph assumes ``past_len >= 1`` because the underlying
+      ``LayerKVCache`` exposes a None-typed ``key``/``value`` when the buffer
+      is empty, and that conditional doesn't survive ONNX tracing. Use this
+      graph from decode step 2 onwards; for step 1, run the regular
+      non-cached :class:`DecoderWrapper` to seed the caches with shape
+      ``(batch, n_kv_heads, 1, head_dim)``.
+    * Cross-attention K/V is recomputed from ``encoder_output`` on every
+      call. This is wasteful but keeps the signature minimal; runtimes can
+      apply their own constant-folding on the encoder output to mitigate.
+
+    Inputs (positional, then variadic):
+
+        ``input_ids`` ``(B, 1)``                          - one new target token per beam
+        ``encoder_output`` ``(B, S, D)``                  - shared across decode steps
+        ``cross_attention_mask`` ``(B, S)``               - encoder padding mask
+        Then 2*n_layers KV tensors interleaved as
+        ``past_key_0, past_value_0, past_key_1, past_value_1, ...``
+        each shaped ``(B, H, past_len, Dh)``.
+
+    Outputs:
+
+        ``logits`` ``(B, 1, V)`` followed by 2*n_layers updated KV tensors
+        each shaped ``(B, H, past_len + 1, Dh)``.
+    """
+
+    def __init__(self, decoder: nn.Module, n_layers: int) -> None:
+        super().__init__()
+        self.decoder = decoder
+        self.n_layers = n_layers
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        encoder_output: torch.Tensor,
+        cross_attention_mask: torch.Tensor,
+        *past_kv: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        from lingolite.generation_utils import KVCache, LayerKVCache
+
+        if len(past_kv) != 2 * self.n_layers:
+            raise ValueError(
+                f"expected {2 * self.n_layers} past KV tensors (n_layers * 2), got {len(past_kv)}"
+            )
+
+        layer_caches = []
+        for i in range(self.n_layers):
+            past_k = past_kv[2 * i]
+            past_v = past_kv[2 * i + 1]
+            layer_cache = LayerKVCache()
+            # Lazy-mode KVCache (no ``reserve``): subsequent ``update`` calls
+            # use ``torch.cat``, which traces cleanly into ONNX.
+            layer_cache.self_attn_cache = KVCache(key=past_k, value=past_v)
+            layer_caches.append(layer_cache)
+
+        # New target slot is always a single valid token.
+        batch_size = int(input_ids.shape[0])
+        self_attention_mask = torch.ones(
+            batch_size, 1, dtype=torch.bool, device=input_ids.device
+        )
+
+        logits, updated_caches = self.decoder(
+            input_ids=input_ids,
+            encoder_output=encoder_output,
+            self_attention_mask=self_attention_mask,
+            cross_attention_mask=cross_attention_mask,
+            past_key_values=layer_caches,
+            use_cache=True,
+        )
+        if updated_caches is None:
+            raise RuntimeError("decoder returned no updated caches under use_cache=True")
+
+        outputs: List[torch.Tensor] = [cast(torch.Tensor, logits)]
+        for layer_cache in updated_caches:
+            new_k = layer_cache.self_attn_cache.key
+            new_v = layer_cache.self_attn_cache.value
+            if new_k is None or new_v is None:
+                raise RuntimeError("layer cache produced no updated key/value tensors")
+            outputs.append(new_k)
+            outputs.append(new_v)
+        return tuple(outputs)
+
+
 def export_encoder_to_onnx(
     model: MobileTranslationModel,
     output_path: Path,
@@ -217,6 +310,97 @@ def export_decoder_to_onnx(
     verify_onnx_model(output_path)
 
 
+def export_cached_decoder_to_onnx(
+    model: MobileTranslationModel,
+    output_path: Path,
+    src_len: int = 32,
+    past_len: int = 1,
+    opset_version: int = 14,
+    dynamic_axes: bool = True,
+) -> None:
+    """Export the cache-aware decoder wrapper to ONNX.
+
+    Args:
+        model: Translation model.
+        output_path: Path to save ONNX model.
+        src_len: Encoder source length to use for dummy inputs (becomes a
+            dynamic axis when ``dynamic_axes=True``).
+        past_len: Past self-attention sequence length to trace with. Must be
+            >= 1 - see :class:`CachedDecoderWrapper` docstring.
+        opset_version: ONNX opset version.
+        dynamic_axes: When True, declare batch / source-len / past-len as
+            dynamic so the same exported graph handles any input shape.
+    """
+    if not ONNX_AVAILABLE:
+        raise ImportError("ONNX not installed. Install with: pip install onnx onnxruntime")
+    if past_len < 1:
+        raise ValueError("past_len must be >= 1; trace with past_len=1 for a generic graph")
+
+    logger.info("Exporting cache-aware decoder to ONNX...")
+
+    decoder_layers = model.decoder._decoder_layers  # type: ignore[attr-defined]
+    n_layers = len(decoder_layers)
+    first_attn = decoder_layers[0].self_attn
+    n_kv_heads = int(first_attn.n_kv_heads)
+    head_dim = int(first_attn.head_dim)
+    d_model = int(model.d_model)
+
+    wrapper = CachedDecoderWrapper(model.decoder, n_layers=n_layers)
+    wrapper.eval()
+
+    # Dummy inputs - shapes must be self-consistent so the wrapper can run.
+    batch = 1
+    dummy_input_ids = torch.randint(0, model.vocab_size, (batch, 1), dtype=torch.long)
+    dummy_encoder_output = torch.randn(batch, src_len, d_model)
+    dummy_cross_mask = torch.ones(batch, src_len, dtype=torch.bool)
+    dummy_past_kvs: List[torch.Tensor] = []
+    for _ in range(n_layers):
+        dummy_past_kvs.append(torch.randn(batch, n_kv_heads, past_len, head_dim))  # key
+        dummy_past_kvs.append(torch.randn(batch, n_kv_heads, past_len, head_dim))  # value
+
+    input_names = ["input_ids", "encoder_output", "cross_attention_mask"]
+    for i in range(n_layers):
+        input_names.append(f"past_key_{i}")
+        input_names.append(f"past_value_{i}")
+
+    output_names = ["logits"]
+    for i in range(n_layers):
+        output_names.append(f"present_key_{i}")
+        output_names.append(f"present_value_{i}")
+
+    if dynamic_axes:
+        axes_dict: Dict[str, Dict[int, str]] = {
+            "input_ids": {0: "batch"},
+            "encoder_output": {0: "batch", 1: "src_len"},
+            "cross_attention_mask": {0: "batch", 1: "src_len"},
+            "logits": {0: "batch"},
+        }
+        for i in range(n_layers):
+            axes_dict[f"past_key_{i}"] = {0: "batch", 2: "past_len"}
+            axes_dict[f"past_value_{i}"] = {0: "batch", 2: "past_len"}
+            axes_dict[f"present_key_{i}"] = {0: "batch", 2: "present_len"}
+            axes_dict[f"present_value_{i}"] = {0: "batch", 2: "present_len"}
+    else:
+        axes_dict = None  # type: ignore[assignment]
+
+    args = (dummy_input_ids, dummy_encoder_output, dummy_cross_mask, *dummy_past_kvs)
+
+    torch.onnx.export(
+        wrapper,
+        args,
+        output_path,
+        export_params=True,
+        opset_version=opset_version,
+        do_constant_folding=True,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=axes_dict,
+    )
+
+    logger.info(f"Cache-aware decoder exported to {output_path}")
+    verify_onnx_model(output_path)
+
+
 def verify_onnx_model(onnx_path: Path) -> bool:
     """
     Verify ONNX model is valid.
@@ -291,6 +475,7 @@ def export_full_model(
     opset_version: int = 14,
     optimize: bool = True,
     verify: bool = True,
+    cached_decoder: bool = False,
 ) -> Dict[str, Path]:
     """
     Export full translation model (encoder + decoder) to ONNX.
@@ -359,6 +544,17 @@ def export_full_model(
         'encoder': encoder_path,
         'decoder': decoder_path,
     }
+
+    # Optionally export the cache-aware decoder for efficient
+    # autoregressive runtime decoding (O(n) instead of O(n^2)).
+    if cached_decoder:
+        cached_decoder_path = output_dir / "decoder_cached.onnx"
+        export_cached_decoder_to_onnx(
+            model=model,
+            output_path=cached_decoder_path,
+            opset_version=opset_version,
+        )
+        exported_paths['decoder_cached'] = cached_decoder_path
 
     # Optimize if requested
     if optimize:
@@ -475,6 +671,11 @@ def main() -> None:
     parser.add_argument('--opset-version', type=int, default=14, help="ONNX opset version")
     parser.add_argument('--no-optimize', action='store_true', help="Skip optimization")
     parser.add_argument('--test', action='store_true', help="Test ONNX inference after export")
+    parser.add_argument(
+        '--cached-decoder',
+        action='store_true',
+        help="Also export a cache-aware decoder (decoder_cached.onnx) for O(n) autoregressive decoding",
+    )
 
     args = parser.parse_args()
 
@@ -484,6 +685,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         opset_version=args.opset_version,
         optimize=not args.no_optimize,
+        cached_decoder=args.cached_decoder,
     )
 
     if args.test:
