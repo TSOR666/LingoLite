@@ -803,15 +803,9 @@ def generate_with_beam_search(
         # pre-allocate once to avoid a fresh ``ones_like`` every step.
         tgt_mask = torch.ones(batch_size * num_beams, 1, dtype=torch.bool, device=device)
 
-        # Python-side mirrors of beam-finished / done state. The scorer keeps
-        # device tensors as part of its public API, but inside this decode
-        # loop nothing on the GPU reads them — they're pure bookkeeping for
-        # the per-step Python selection. By keeping the mirrors in Python and
-        # only flushing them back to the scorer at decode end, we save two
-        # device->host syncs *per step* (previously ``.tolist()`` calls).
-        beam_finished_py: List[List[bool]] = [
-            [False] * num_beams for _ in range(batch_size)
-        ]
+        # Python-side done state. The scorer keeps a device tensor as part of
+        # its public API, but inside this decode loop it is pure bookkeeping.
+        # Keeping the mirror in Python avoids a device->host sync per step.
         done_py: List[bool] = [False] * batch_size
 
         # Generate
@@ -863,18 +857,14 @@ def generate_with_beam_search(
             cand_tokens_cpu, cand_beams_cpu = cand_pack[0], cand_pack[1]
             cand_scores_cpu = next_scores.cpu().tolist()
 
-            # ``beam_finished_py`` / ``done_py`` are maintained across the
-            # whole decode loop (initialized once before the for-step loop),
-            # so we no longer pull them off the scorer's device tensors here.
+            # ``done_py`` is maintained across the whole decode loop, so we
+            # no longer pull it off the scorer's device tensor here.
 
             # Pre-allocate per-batch selection buffers sized for num_beams.
             new_beam_idx_global = [0] * (batch_size * num_beams)
             new_beam_next_tokens = [pad_token_id] * (batch_size * num_beams)
             new_beam_scores = [float('-inf')] * (batch_size * num_beams)
 
-            # Collect per-batch finished-state updates to flush back to the
-            # scorer's device tensors at the *end of the decode loop* — not
-            # every step. We just track the running mirror in ``beam_finished_py``.
             done_this_step: List[int] = []
 
             for batch_idx in range(batch_size):
@@ -888,7 +878,6 @@ def generate_with_beam_search(
                         new_beam_scores[first_beam_global + i] = float('-inf')
                     continue
 
-                batch_finished_row = beam_finished_py[batch_idx]
                 selected = 0
                 for cand_pos in range(2 * num_beams):
                     if selected >= num_beams:
@@ -901,16 +890,14 @@ def generate_with_beam_search(
 
                     if token_id == eos_token_id:
                         # Finish this hypothesis but do not consume a live beam slot.
-                        if not batch_finished_row[beam_offset]:
-                            prev_seq = input_ids[source_global]
-                            eos_tensor = torch.tensor(
-                                [eos_token_id], device=prev_seq.device, dtype=prev_seq.dtype
-                            )
-                            full_seq = torch.cat([prev_seq, eos_tensor])
-                            beam_scorer.finished_hypotheses[batch_idx].append(
-                                BeamHypothesis(tokens=full_seq.clone(), score=score)
-                            )
-                            batch_finished_row[beam_offset] = True
+                        prev_seq = input_ids[source_global]
+                        eos_tensor = torch.tensor(
+                            [eos_token_id], device=prev_seq.device, dtype=prev_seq.dtype
+                        )
+                        full_seq = torch.cat([prev_seq, eos_tensor])
+                        beam_scorer.finished_hypotheses[batch_idx].append(
+                            BeamHypothesis(tokens=full_seq.clone(), score=score)
+                        )
                         continue
 
                     slot = first_beam_global + selected
@@ -936,7 +923,10 @@ def generate_with_beam_search(
                     if len(beam_scorer.finished_hypotheses[batch_idx]) >= num_beams:
                         done_this_step.append(batch_idx)
                 else:
-                    if all(batch_finished_row):
+                    batch_scores = new_beam_scores[
+                        first_beam_global:first_beam_global + num_beams
+                    ]
+                    if all(score == float("-inf") for score in batch_scores):
                         done_this_step.append(batch_idx)
 
             for bi in done_this_step:
@@ -968,14 +958,8 @@ def generate_with_beam_search(
                 logger.info(f"Beam search early stopping at step {step + 1}")
                 break
 
-        # Flush the Python mirrors back to the scorer's device tensors so any
-        # caller that later inspects ``beam_scorer.beam_is_finished`` /
-        # ``beam_scorer.done`` (e.g. tests) sees consistent state. Doing this
-        # once at decode end replaces O(steps) per-step writes.
-        if any(any(row) for row in beam_finished_py):
-            beam_scorer.beam_is_finished = torch.tensor(
-                beam_finished_py, dtype=torch.bool, device=device
-            )
+        # Flush the Python mirror back to the scorer's device tensor so any
+        # caller that later inspects ``beam_scorer.done`` sees consistent state.
         if any(done_py):
             beam_scorer.done = torch.tensor(done_py, dtype=torch.bool, device=device)
 

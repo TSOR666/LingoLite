@@ -624,6 +624,7 @@ class TranslationTrainer:
         print(f"Max steps: {self.max_steps}")
 
         running_loss: float = 0.0
+        running_loss_count = 0
         training_complete = False
 
         for epoch in range(num_epochs):
@@ -643,21 +644,29 @@ class TranslationTrainer:
                     training_complete = True
                     break
 
+                previous_global_step = self.global_step
                 loss, metrics = self.train_step(batch)
                 running_loss += loss
+                running_loss_count += 1
+                did_optimizer_step = self.global_step > previous_global_step
 
                 # Update progress bar
-                if self.global_step % log_steps == 0:
-                    avg_loss = running_loss / log_steps
+                if did_optimizer_step and self.global_step % log_steps == 0:
+                    avg_loss = running_loss / max(1, running_loss_count)
                     progress_bar.set_postfix({
                         'loss': f"{avg_loss:.4f}",
                         'lr': f"{metrics['lr']:.2e}",
                         'step': self.global_step,
                     })
                     running_loss = 0
+                    running_loss_count = 0
 
                 # Evaluation
-                if self.global_step % eval_steps == 0 and self.val_loader is not None:
+                if (
+                    did_optimizer_step
+                    and self.global_step % eval_steps == 0
+                    and self.val_loader is not None
+                ):
                     val_metrics = self.evaluate()
                     print(f"\nStep {self.global_step} - Validation:")
                     print(f"  Loss: {val_metrics['val_loss']:.4f}")
@@ -669,7 +678,7 @@ class TranslationTrainer:
                         self.save_checkpoint('best_model.pt')
 
                 # Save checkpoint
-                if self.global_step % save_steps == 0:
+                if did_optimizer_step and self.global_step % save_steps == 0:
                     self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
 
         print(f"\n{'='*80}")

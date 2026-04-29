@@ -267,7 +267,7 @@ def evaluate_model(
 
     # Load model
     logger.info(f"Loading model from {model_path}")
-    checkpoint = torch.load(model_path, map_location=device_obj)
+    checkpoint = torch.load(model_path, map_location=device_obj, weights_only=True)
 
     # Extract config from checkpoint
     if isinstance(checkpoint, dict) and 'config' in checkpoint:

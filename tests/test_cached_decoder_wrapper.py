@@ -11,9 +11,6 @@ skipped when ``onnx``/``onnxruntime`` aren't installed.
 
 from __future__ import annotations
 
-import shutil
-import tempfile
-from pathlib import Path
 from typing import List
 
 import pytest
@@ -22,6 +19,7 @@ import torch
 from lingolite.generation_utils import KVCache, LayerKVCache
 from lingolite.mobile_translation_model import create_model
 from scripts.export_onnx import CachedDecoderWrapper
+from tests.tmp_utils import writable_tmp_dir
 
 
 @pytest.fixture(scope="module")
@@ -152,10 +150,7 @@ class TestOnnxExport:
 
         # Project-local tmp dir to dodge the stale Windows %TEMP% perms that
         # break pytest's ``tmp_path`` on this machine.
-        project_tmp_root = Path(".tmp_pytest")
-        project_tmp_root.mkdir(exist_ok=True)
-        out_dir = Path(tempfile.mkdtemp(prefix="onnx_export_", dir=str(project_tmp_root)))
-        try:
+        with writable_tmp_dir("onnx_export_") as out_dir:
             model, *_ = small_model_and_dims
             out_path = out_dir / "decoder_cached.onnx"
             export_cached_decoder_to_onnx(
@@ -166,5 +161,3 @@ class TestOnnxExport:
             )
             assert out_path.exists()
             assert out_path.stat().st_size > 0
-        finally:
-            shutil.rmtree(out_dir, ignore_errors=True)

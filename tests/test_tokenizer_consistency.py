@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
 
@@ -28,6 +27,7 @@ import sentencepiece as spm  # type: ignore[import-untyped]
 import torch
 
 from lingolite.translation_tokenizer import TranslationTokenizer
+from tests.tmp_utils import writable_tmp_dir
 
 
 # ---------------------------------------------------------------------------
@@ -83,50 +83,44 @@ def trained_tokenizer() -> Iterator[Tuple[TranslationTokenizer, Path]]:
 
     pairs = json.loads(_TINY_DATASET.read_text(encoding="utf-8"))
 
-    project_tmp_root = Path(".tmp_pytest")
-    project_tmp_root.mkdir(exist_ok=True)
-    out_dir = Path(tempfile.mkdtemp(prefix="real_spm_tokenizer_", dir=str(project_tmp_root)))
-    corpus_path = out_dir / "corpus.txt"
-    _build_corpus(pairs, corpus_path)
+    with writable_tmp_dir("real_spm_tokenizer_") as out_dir:
+        corpus_path = out_dir / "corpus.txt"
+        _build_corpus(pairs, corpus_path)
 
-    model_prefix = out_dir / "translation_tokenizer"
-    languages = list(_SUPPORTED_LANGS)
-    # Vocab needs room for: pad/sos/eos/unk (4) + src/tgt (2) + langs (6)
-    # plus subword pieces from the corpus. SentencePiece refuses a vocab_size
-    # larger than the unique-piece count it can produce, which on this 39-pair
-    # tiny corpus tops out around ~109. 100 leaves a safety margin while still
-    # exercising real subwording.
-    sp_vocab_size = 100
-    _train_sp_model(corpus_path, model_prefix, vocab_size=sp_vocab_size, languages=languages)
+        model_prefix = out_dir / "translation_tokenizer"
+        languages = list(_SUPPORTED_LANGS)
+        # Vocab needs room for: pad/sos/eos/unk (4) + src/tgt (2) + langs (6)
+        # plus subword pieces from the corpus. SentencePiece refuses a vocab_size
+        # larger than the unique-piece count it can produce, which on this 39-pair
+        # tiny corpus tops out around ~109. 100 leaves a safety margin while still
+        # exercising real subwording.
+        sp_vocab_size = 100
+        _train_sp_model(corpus_path, model_prefix, vocab_size=sp_vocab_size, languages=languages)
 
-    tokenizer = TranslationTokenizer(
-        languages=languages, vocab_size=sp_vocab_size, model_prefix="translation_tokenizer"
-    )
-    tokenizer.load(str(model_prefix.with_suffix(".model")))
+        tokenizer = TranslationTokenizer(
+            languages=languages, vocab_size=sp_vocab_size, model_prefix="translation_tokenizer"
+        )
+        tokenizer.load(str(model_prefix.with_suffix(".model")))
 
-    # Persist a tokenizer_config.json so ``from_pretrained`` can re-load it.
-    save_dir = out_dir / "saved"
-    save_dir.mkdir(exist_ok=True)
-    (save_dir / "tokenizer_config.json").write_text(
-        json.dumps(
-            {
-                "languages": languages,
-                "vocab_size": sp_vocab_size,
-                "special_tokens": tokenizer.special_tokens,
-                "model_prefix": "translation_tokenizer",
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    shutil.copyfile(model_prefix.with_suffix(".model"), save_dir / "translation_tokenizer.model")
-    shutil.copyfile(model_prefix.with_suffix(".vocab"), save_dir / "translation_tokenizer.vocab")
+        # Persist a tokenizer_config.json so ``from_pretrained`` can re-load it.
+        save_dir = out_dir / "saved"
+        save_dir.mkdir(exist_ok=True)
+        (save_dir / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "languages": languages,
+                    "vocab_size": sp_vocab_size,
+                    "special_tokens": tokenizer.special_tokens,
+                    "model_prefix": "translation_tokenizer",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        shutil.copyfile(model_prefix.with_suffix(".model"), save_dir / "translation_tokenizer.model")
+        shutil.copyfile(model_prefix.with_suffix(".vocab"), save_dir / "translation_tokenizer.vocab")
 
-    try:
         yield tokenizer, save_dir
-    finally:
-        # Best-effort cleanup; ignore Windows permission quirks on stale handles.
-        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

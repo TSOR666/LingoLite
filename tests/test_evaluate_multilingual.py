@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Iterator, Tuple
 
@@ -35,6 +34,7 @@ from scripts.evaluate_multilingual import (
     _parse_buckets,
     evaluate,
 )
+from tests.tmp_utils import writable_tmp_dir
 
 
 _TINY_DATASET = Path("examples/data/tiny_dataset.json")
@@ -112,78 +112,72 @@ def trained_artifacts() -> Iterator[Tuple[Path, Path, Path]]:
     if not _TINY_DATASET.exists():
         pytest.skip(f"missing tiny dataset at {_TINY_DATASET}")
 
-    project_tmp_root = Path(".tmp_pytest")
-    project_tmp_root.mkdir(exist_ok=True)
-    out_dir = Path(tempfile.mkdtemp(prefix="evaluate_multilingual_", dir=str(project_tmp_root)))
+    with writable_tmp_dir("evaluate_multilingual_") as out_dir:
+        pairs = json.loads(_TINY_DATASET.read_text(encoding="utf-8"))
+        corpus_path = out_dir / "corpus.txt"
+        with corpus_path.open("w", encoding="utf-8") as fh:
+            for p in pairs:
+                fh.write(p["src_text"].strip() + "\n")
+                fh.write(p["tgt_text"].strip() + "\n")
 
-    pairs = json.loads(_TINY_DATASET.read_text(encoding="utf-8"))
-    corpus_path = out_dir / "corpus.txt"
-    with corpus_path.open("w", encoding="utf-8") as fh:
-        for p in pairs:
-            fh.write(p["src_text"].strip() + "\n")
-            fh.write(p["tgt_text"].strip() + "\n")
+        languages = ["en", "es", "fr", "de", "it", "da"]
+        sp_prefix = out_dir / "tok"
+        spm.SentencePieceTrainer.train(
+            input=str(corpus_path),
+            model_prefix=str(sp_prefix),
+            vocab_size=100,
+            character_coverage=1.0,
+            model_type="unigram",
+            pad_id=0,
+            unk_id=3,
+            bos_id=1,
+            eos_id=2,
+            pad_piece="<pad>",
+            unk_piece="<unk>",
+            bos_piece="<s>",
+            eos_piece="</s>",
+            user_defined_symbols=[f"<{lang}>" for lang in languages] + ["<src>", "<tgt>"],
+            num_threads=1,
+        )
 
-    languages = ["en", "es", "fr", "de", "it", "da"]
-    sp_prefix = out_dir / "tok"
-    spm.SentencePieceTrainer.train(
-        input=str(corpus_path),
-        model_prefix=str(sp_prefix),
-        vocab_size=100,
-        character_coverage=1.0,
-        model_type="unigram",
-        pad_id=0,
-        unk_id=3,
-        bos_id=1,
-        eos_id=2,
-        pad_piece="<pad>",
-        unk_piece="<unk>",
-        bos_piece="<s>",
-        eos_piece="</s>",
-        user_defined_symbols=[f"<{lang}>" for lang in languages] + ["<src>", "<tgt>"],
-        num_threads=1,
-    )
+        tokenizer = TranslationTokenizer(languages=languages, vocab_size=100, model_prefix="tok")
+        tokenizer.load(str(sp_prefix.with_suffix(".model")))
 
-    tokenizer = TranslationTokenizer(languages=languages, vocab_size=100, model_prefix="tok")
-    tokenizer.load(str(sp_prefix.with_suffix(".model")))
+        tokenizer_dir = out_dir / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "languages": languages,
+                    "vocab_size": 100,
+                    "special_tokens": tokenizer.special_tokens,
+                    "model_prefix": "tok",
+                }
+            ),
+            encoding="utf-8",
+        )
+        shutil.copyfile(sp_prefix.with_suffix(".model"), tokenizer_dir / "tok.model")
 
-    tokenizer_dir = out_dir / "tokenizer"
-    tokenizer_dir.mkdir()
-    (tokenizer_dir / "tokenizer_config.json").write_text(
-        json.dumps(
-            {
-                "languages": languages,
-                "vocab_size": 100,
-                "special_tokens": tokenizer.special_tokens,
-                "model_prefix": "tok",
-            }
-        ),
-        encoding="utf-8",
-    )
-    shutil.copyfile(sp_prefix.with_suffix(".model"), tokenizer_dir / "tok.model")
+        config = dict(
+            vocab_size=tokenizer.get_vocab_size(),
+            d_model=64,
+            n_encoder_layers=2,
+            n_decoder_layers=2,
+            n_heads=2,
+            n_kv_heads=1,
+            d_ff=128,
+            max_seq_len=64,
+        )
+        model = MobileTranslationModel(**config)
+        ckpt_path = out_dir / "model.pt"
+        torch.save({"config": config, "model_state_dict": model.state_dict()}, ckpt_path)
 
-    config = dict(
-        vocab_size=tokenizer.get_vocab_size(),
-        d_model=64,
-        n_encoder_layers=2,
-        n_decoder_layers=2,
-        n_heads=2,
-        n_kv_heads=1,
-        d_ff=128,
-        max_seq_len=64,
-    )
-    model = MobileTranslationModel(**config)
-    ckpt_path = out_dir / "model.pt"
-    torch.save({"config": config, "model_state_dict": model.state_dict()}, ckpt_path)
+        # A small slice of the tiny dataset that spans multiple pairs.
+        small = [p for p in pairs if (p["src_lang"], p["tgt_lang"]) in {("en", "es"), ("en", "fr"), ("es", "en")}]
+        ds_path = out_dir / "subset.json"
+        ds_path.write_text(json.dumps(small[:9]), encoding="utf-8")
 
-    # A small slice of the tiny dataset that spans multiple pairs.
-    small = [p for p in pairs if (p["src_lang"], p["tgt_lang"]) in {("en", "es"), ("en", "fr"), ("es", "en")}]
-    ds_path = out_dir / "subset.json"
-    ds_path.write_text(json.dumps(small[:9]), encoding="utf-8")
-
-    try:
         yield ckpt_path, tokenizer_dir, ds_path
-    finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 class TestEndToEnd:
