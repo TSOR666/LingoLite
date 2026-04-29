@@ -14,8 +14,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from unittest.mock import MagicMock, patch
 from typing import Dict, List
-import tempfile
-from pathlib import Path
 
 from lingolite.mobile_translation_model import MobileTranslationModel, create_model
 from lingolite.training import (
@@ -23,6 +21,7 @@ from lingolite.training import (
     TranslationTrainer,
     collate_fn,
 )
+from tests.tmp_utils import writable_tmp_dir
 
 
 # ============================================================================
@@ -277,12 +276,12 @@ class TestTranslationTrainer:
             }
         ]
         
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with writable_tmp_dir("trainer_init_") as tmpdir:
             trainer = TranslationTrainer(
                 model=tiny_model,
                 train_loader=mock_loader,
                 device='cpu',
-                save_dir=tmpdir,
+                save_dir=str(tmpdir),
                 max_steps=100,
             )
             
@@ -300,12 +299,12 @@ class TestTranslationTrainer:
             }
         ]
         
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with writable_tmp_dir("trainer_step_") as tmpdir:
             trainer = TranslationTrainer(
                 model=tiny_model,
                 train_loader=mock_loader,
                 device='cpu',
-                save_dir=tmpdir,
+                save_dir=str(tmpdir),
                 max_steps=100,
             )
             
@@ -327,12 +326,12 @@ class TestTranslationTrainer:
             }
         ]
         
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with writable_tmp_dir("trainer_update_") as tmpdir:
             trainer = TranslationTrainer(
                 model=tiny_model,
                 train_loader=mock_loader,
                 device='cpu',
-                save_dir=tmpdir,
+                save_dir=str(tmpdir),
                 max_steps=100,
             )
             
@@ -365,12 +364,12 @@ class TestTranslationTrainer:
             }
         ]
         
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with writable_tmp_dir("trainer_ckpt_") as tmpdir:
             trainer = TranslationTrainer(
                 model=tiny_model,
                 train_loader=mock_loader,
                 device='cpu',
-                save_dir=tmpdir,
+                save_dir=str(tmpdir),
                 max_steps=100,
             )
             
@@ -379,14 +378,14 @@ class TestTranslationTrainer:
             step_before = trainer.global_step
             
             # Save checkpoint
-            checkpoint_path = f"{tmpdir}/test_checkpoint.pt"
-            trainer.save_checkpoint(checkpoint_path)
+            checkpoint_path = tmpdir / "test_checkpoint.pt"
+            trainer.save_checkpoint(str(checkpoint_path))
             
-            assert Path(checkpoint_path).exists()
+            assert checkpoint_path.exists()
             
             # Reset step and load
             trainer.global_step = 0
-            trainer.load_checkpoint(checkpoint_path)
+            trainer.load_checkpoint(str(checkpoint_path))
             
             assert trainer.global_step == step_before
 
@@ -399,12 +398,12 @@ class TestTranslationTrainer:
             'tgt_attention_mask': torch.zeros(0, 8),
         }
         
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with writable_tmp_dir("trainer_empty_") as tmpdir:
             trainer = TranslationTrainer(
                 model=tiny_model,
                 train_loader=[empty_batch],
                 device='cpu',
-                save_dir=tmpdir,
+                save_dir=str(tmpdir),
                 max_steps=100,
             )
             
@@ -412,6 +411,34 @@ class TestTranslationTrainer:
             
             # Should return 0 loss for empty batch
             assert loss == 0.0
+
+    def test_train_accumulation_saves_only_after_optimizer_step(
+        self, tiny_model: MobileTranslationModel
+    ) -> None:
+        """Accumulation micro-steps should not trigger step-0 checkpoints."""
+        batch = {
+            'src_input_ids': torch.randint(0, 100, (2, 10)),
+            'tgt_input_ids': torch.randint(0, 100, (2, 8)),
+            'src_attention_mask': torch.ones(2, 10),
+            'tgt_attention_mask': torch.ones(2, 8),
+        }
+
+        with writable_tmp_dir("trainer_accum_") as tmpdir:
+            trainer = TranslationTrainer(
+                model=tiny_model,
+                train_loader=[batch, batch],
+                device='cpu',
+                save_dir=str(tmpdir),
+                max_steps=1,
+                warmup_steps=0,
+                gradient_accumulation_steps=2,
+            )
+
+            trainer.train(num_epochs=1, eval_steps=99, save_steps=1, log_steps=1)
+
+            assert trainer.global_step == 1
+            assert not (tmpdir / "checkpoint_step_0.pt").exists()
+            assert (tmpdir / "checkpoint_step_1.pt").exists()
 
 
 # ============================================================================

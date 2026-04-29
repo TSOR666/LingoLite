@@ -9,9 +9,13 @@ Legacy regression tests are enabled by default but can be skipped via:
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 from typing import Iterable
 
 import pytest
+
+from tests.tmp_utils import make_writable_tmp_dir
 
 LEGACY_TEST_PATTERNS = [
     "test_cache_fix.py",
@@ -26,6 +30,20 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Skip legacy/large regression suites (can also set LIGOLITE_SKIP_HEAVY_TESTS=1).",
     )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "slow: marks tests as slow")
+
+
+@pytest.fixture
+def tmp_path() -> Iterable[Path]:
+    """Sandbox-safe replacement for pytest's tempfile-backed tmp_path."""
+    path = make_writable_tmp_dir("tmp_path_")
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _should_skip_heavy(config: pytest.Config) -> bool:

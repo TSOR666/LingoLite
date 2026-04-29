@@ -34,3 +34,6 @@ data/
 .coverage
 htmlcov/
 .pytest_cache/
+.tmp_manual/
+.tmp_pytest/
+.uv-cache/

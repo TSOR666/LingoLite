@@ -234,6 +234,85 @@ def test_beam_search_preserves_multiple_finished_hypotheses() -> None:
     assert model._step_counter["idx"] >= 2
 
 
+class _PrefixAwareBeamModel(torch.nn.Module):
+    """Beam-search stub whose logits depend on the current live prefix."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.vocab_size = 8
+        self.pad_token_id = 0
+        encoder_module = torch.nn.Module()
+        encoder_module.embedding = torch.nn.Embedding(self.vocab_size, 8)
+        self.encoder_module = encoder_module
+
+        decoder_module = torch.nn.Module()
+        decoder_module.layers = torch.nn.ModuleList()
+        self.decoder_module = decoder_module
+
+    def eval(self):  # type: ignore[override]
+        return self
+
+    def train(self, mode: bool = True):  # type: ignore[override]
+        return self
+
+    def encoder(self, input_ids, attention_mask=None):
+        batch, src_len = input_ids.shape
+        return self.encoder_module.embedding.weight.new_zeros(
+            (batch, src_len, 8),
+            device=input_ids.device,
+        )
+
+    def decoder(
+        self,
+        input_ids,
+        encoder_output,
+        self_attention_mask=None,
+        cross_attention_mask=None,
+        past_key_values=None,
+        use_cache: bool = False,
+    ):
+        batch, tgt_len = input_ids.shape
+        logits = torch.full(
+            (batch, tgt_len, self.vocab_size),
+            -1e9,
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        last_tokens = input_ids[:, -1]
+        for row, last_token in enumerate(last_tokens.tolist()):
+            if last_token == 1:
+                # First step: record an EOS candidate, while keeping token 3
+                # alive so it can finish as the best hypothesis next step.
+                logits[row, -1, 3] = 0.0
+                logits[row, -1, 2] = -0.1
+                logits[row, -1, 4] = -2.0
+            elif last_token == 3:
+                logits[row, -1, 2] = 0.0
+            elif last_token == 4:
+                logits[row, -1, 2] = -2.0
+            else:
+                logits[row, -1, 2] = -4.0
+        return logits, past_key_values
+
+
+def test_beam_search_does_not_treat_reused_beam_slot_as_finished() -> None:
+    """A beam slot that emitted EOS can be reused by a live continuation."""
+    model = _PrefixAwareBeamModel()
+    out = generate_with_beam_search(
+        model=model,
+        src_input_ids=torch.zeros(1, 3, dtype=torch.long),
+        max_length=5,
+        num_beams=2,
+        length_penalty=1.0,
+        early_stopping=True,
+        sos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+
+    assert out[0, :3].tolist() == [1, 3, 2]
+
+
 def test_beam_search_uses_incremental_kv_cache() -> None:
     """Beam search should decode a single token per step and thread caches."""
     model = _CachingScriptedModel(
