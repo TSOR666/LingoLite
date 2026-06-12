@@ -48,10 +48,9 @@ def test_decoder_forward_signature():
         print("✗ Found issues:")
         for issue in issues:
             print(f"  - {issue}")
-        return False
+        raise AssertionError("\n".join(issues))
     else:
         print("✓ TransformerDecoder.forward has correct signature")
-        return True
 
 
 def test_decoder_layer_forward_signature():
@@ -78,10 +77,9 @@ def test_decoder_layer_forward_signature():
         print("✗ Found issues:")
         for issue in issues:
             print(f"  - {issue}")
-        return False
+        raise AssertionError("\n".join(issues))
     else:
         print("✓ DecoderLayer.forward has correct signature")
-        return True
 
 
 def test_mobile_model_imports():
@@ -108,10 +106,9 @@ def test_mobile_model_imports():
         print("✗ Found issues:")
         for issue in issues:
             print(f"  - {issue}")
-        return False
+        raise AssertionError("\n".join(issues))
     else:
         print("✓ MobileTranslationModel imports are correct")
-        return True
 
 
 def test_decoder_return_consistency():
@@ -135,11 +132,12 @@ def test_decoder_return_consistency():
     # Pattern 2: Check that beam search uses tuple unpacking
     beam_search_section = content[content.find('def generate_with_beam_search'):]
     if 'model.decoder(' in beam_search_section:
-        # Should have "logits, _" pattern
-        if 'logits, _ = model.decoder(' not in beam_search_section:
-            # Could also be decoder_outputs pattern which is fine
-            if 'decoder_outputs = model.decoder(' not in beam_search_section:
-                issues.append("lingolite/generation_utils.py: beam search doesn't properly unpack decoder return")
+        tuple_unpack = re.search(
+            r'logits\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*model\.decoder\(',
+            beam_search_section,
+        )
+        if tuple_unpack is None and 'decoder_outputs = model.decoder(' not in beam_search_section:
+            issues.append("lingolite/generation_utils.py: beam search doesn't properly unpack decoder return")
 
     # Check lingolite/mobile_translation_model.py patterns
     with open('lingolite/mobile_translation_model.py', 'r') as f:
@@ -154,10 +152,9 @@ def test_decoder_return_consistency():
         print("✗ Found issues:")
         for issue in issues:
             print(f"  - {issue}")
-        return False
+        raise AssertionError("\n".join(issues))
     else:
         print("✓ All decoder calls properly handle tuple returns")
-        return True
 
 
 def test_gqa_consistency():
@@ -209,10 +206,9 @@ def test_gqa_consistency():
         print("✗ Found issues:")
         for issue in issues:
             print(f"  - {issue}")
-        return False
+        raise AssertionError("\n".join(issues))
     else:
         print("✓ GroupedQueryAttention has consistent return signature")
-        return True
 
 
 def main():
@@ -229,7 +225,14 @@ def main():
         test_gqa_consistency,
     ]
 
-    results = [test() for test in tests]
+    results = []
+    for test in tests:
+        try:
+            test()
+            results.append(True)
+        except AssertionError as exc:
+            print(f"✗ {test.__name__}: {exc}")
+            results.append(False)
 
     print("\n" + "=" * 70)
     if all(results):

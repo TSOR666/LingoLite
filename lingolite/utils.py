@@ -4,9 +4,11 @@ Input validation, logging, and helper functions
 """
 
 import logging
+import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -320,6 +322,26 @@ class InputValidator:
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+def atomic_torch_save(obj: object, path: Union[str, Path]) -> Path:
+    """Write a torch checkpoint atomically so failures do not corrupt the target."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(obj, temporary_path)
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return destination
+
 
 def count_parameters(model: torch.nn.Module) -> Dict[str, int]:
     """

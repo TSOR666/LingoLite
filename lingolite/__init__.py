@@ -2,7 +2,12 @@
 
 __version__ = "0.1.0"
 
-from .mobile_translation_model import MobileTranslationModel, create_model
+from .mobile_translation_model import (
+    MobileTranslationModel,
+    create_model,
+    extract_model_state_dict,
+    load_model_from_checkpoint,
+)
 from .translation_tokenizer import TranslationTokenizer
 from .generation_utils import (
     KVCache,
@@ -26,6 +31,9 @@ from .quantization_utils import (
     measure_model_size,
     benchmark_model,
     compare_quantization_methods,
+    make_quantized_checkpoint,
+    save_quantized_checkpoint,
+    load_quantized_model_from_checkpoint,
 )
 from .utils import (
     InputValidator,
@@ -35,11 +43,14 @@ from .utils import (
     format_time,
     get_device,
     set_seed,
+    atomic_torch_save,
 )
 
 __all__ = [
     "MobileTranslationModel",
     "create_model",
+    "extract_model_state_dict",
+    "load_model_from_checkpoint",
     "TranslationTokenizer",
     "KVCache",
     "LayerKVCache",
@@ -58,6 +69,9 @@ __all__ = [
     "measure_model_size",
     "benchmark_model",
     "compare_quantization_methods",
+    "make_quantized_checkpoint",
+    "save_quantized_checkpoint",
+    "load_quantized_model_from_checkpoint",
     "InputValidator",
     "setup_logger",
     "logger",
@@ -65,4 +79,5 @@ __all__ = [
     "format_time",
     "get_device",
     "set_seed",
+    "atomic_torch_save",
 ]

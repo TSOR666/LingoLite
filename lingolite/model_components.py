@@ -338,13 +338,19 @@ class GroupedQueryAttention(nn.Module):
             if value is None:
                 value = query
 
-            new_kv_len = key.shape[1]
+            key_batch, new_kv_len, _ = key.shape
+            if value.shape[0] != key_batch:
+                raise ValueError("Cross-attention key and value batch sizes must match")
 
             K_new = self.k_proj(key)
             V_new = self.v_proj(value)
 
-            K_new = K_new.view(batch, new_kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-            V_new = V_new.view(batch, new_kv_len, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            K_new = K_new.view(
+                key_batch, new_kv_len, self.n_kv_heads, self.head_dim
+            ).permute(0, 2, 1, 3)
+            V_new = V_new.view(
+                key_batch, new_kv_len, self.n_kv_heads, self.head_dim
+            ).permute(0, 2, 1, 3)
 
             if rope is not None and not self.is_cross_attn:
                 past_len = 0 if past_key is None else past_key.shape[2]
@@ -381,7 +387,23 @@ class GroupedQueryAttention(nn.Module):
             K = K.to(dtype=Q.dtype)
             V = V.to(dtype=Q.dtype)
 
+        kv_batch = K.shape[0]
         kv_len = K.shape[2]
+        beam_group_size = 1
+        if kv_batch != batch:
+            if not self.is_cross_attn or batch % kv_batch != 0:
+                raise ValueError(
+                    "Attention query batch must match key/value batch, or be "
+                    "an integer beam multiple for cross-attention"
+                )
+            beam_group_size = batch // kv_batch
+            Q = Q.view(
+                kv_batch,
+                beam_group_size,
+                self.n_heads,
+                q_len,
+                self.head_dim,
+            )
 
         valid_mask: Optional[torch.Tensor] = None
         if attention_mask is not None:
@@ -408,6 +430,18 @@ class GroupedQueryAttention(nn.Module):
                 has_negative = (is_numeric < 0.0).any(dim=-1, keepdim=True)
                 valid_mask = torch.where(has_negative, additive_valid, binary_valid)
 
+            if beam_group_size > 1:
+                if valid_mask.shape[0] == kv_batch:
+                    valid_mask = valid_mask.unsqueeze(1)
+                elif valid_mask.shape[0] == batch:
+                    valid_mask = valid_mask.view(
+                        kv_batch, beam_group_size, *valid_mask.shape[1:]
+                    )
+                else:
+                    raise ValueError(
+                        "Cross-attention mask batch must match the source or query batch"
+                    )
+
         if self.is_causal:
             causal_valid_mask = self._get_causal_mask(q_len, kv_len, Q.device)
             valid_mask = (
@@ -428,20 +462,36 @@ class GroupedQueryAttention(nn.Module):
             valid_mask = valid_mask | fully_masked
 
         dropout_p = self.dropout_p if self.training else 0.0
+        if beam_group_size > 1:
+            K_for_attention = K.unsqueeze(1)
+            V_for_attention = V.unsqueeze(1)
+            kv_head_dim = 2
+        else:
+            K_for_attention = K
+            V_for_attention = V
+            kv_head_dim = 1
 
         if hasattr(F, "scaled_dot_product_attention"):
             if _SDPA_SUPPORTS_GQA and self.n_rep > 1:
                 output = F.scaled_dot_product_attention(
                     Q,
-                    K,
-                    V,
+                    K_for_attention,
+                    V_for_attention,
                     attn_mask=valid_mask,
                     dropout_p=dropout_p,
                     enable_gqa=True,
                 )
             else:
-                K_for_scores = K.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else K
-                V_for_scores = V.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else V
+                K_for_scores = (
+                    K_for_attention.repeat_interleave(self.n_rep, dim=kv_head_dim)
+                    if self.n_rep > 1
+                    else K_for_attention
+                )
+                V_for_scores = (
+                    V_for_attention.repeat_interleave(self.n_rep, dim=kv_head_dim)
+                    if self.n_rep > 1
+                    else V_for_attention
+                )
                 output = F.scaled_dot_product_attention(
                     Q,
                     K_for_scores,
@@ -451,11 +501,15 @@ class GroupedQueryAttention(nn.Module):
                 )
         else:
             if self.n_rep > 1:
-                K_for_scores = K.repeat_interleave(self.n_rep, dim=1)
-                V_for_scores = V.repeat_interleave(self.n_rep, dim=1)
+                K_for_scores = K_for_attention.repeat_interleave(
+                    self.n_rep, dim=kv_head_dim
+                )
+                V_for_scores = V_for_attention.repeat_interleave(
+                    self.n_rep, dim=kv_head_dim
+                )
             else:
-                K_for_scores = K
-                V_for_scores = V
+                K_for_scores = K_for_attention
+                V_for_scores = V_for_attention
 
             scores = torch.matmul(Q, K_for_scores.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
@@ -475,7 +529,12 @@ class GroupedQueryAttention(nn.Module):
             # Zero out query positions that had no valid keys (sync-free).
             output = torch.where(fully_masked, torch.zeros_like(output), output)
 
-        output = output.transpose(1, 2).contiguous().view(batch, q_len, -1)  # (B, n_heads, q_len, head_dim) -> (B, q_len, n_heads * head_dim)
+        if beam_group_size > 1:
+            output = output.permute(0, 1, 3, 2, 4).contiguous().view(
+                batch, q_len, -1
+            )
+        else:
+            output = output.transpose(1, 2).contiguous().view(batch, q_len, -1)
         output = self.o_proj(output)
 
         # Return the cache object that was just updated in-place (same instance

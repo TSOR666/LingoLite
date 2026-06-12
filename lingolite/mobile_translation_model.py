@@ -3,7 +3,7 @@ Complete Mobile Translation Model
 Encoder-Decoder transformer optimized for mobile deployment
 """
 
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, TypedDict, Set, SupportsFloat, SupportsInt, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, TypedDict, Set, SupportsFloat, SupportsInt, cast
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,19 @@ class MobileTranslationModel(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.pad_token_id = pad_token_id
+        self._config: Dict[str, Any] = {
+            "vocab_size": int(vocab_size),
+            "d_model": int(d_model),
+            "n_encoder_layers": int(n_encoder_layers),
+            "n_decoder_layers": int(n_decoder_layers),
+            "n_heads": int(n_heads),
+            "n_kv_heads": int(n_kv_heads),
+            "d_ff": int(d_ff),
+            "max_seq_len": int(max_seq_len),
+            "dropout": float(dropout),
+            "tie_embeddings": bool(tie_embeddings),
+            "pad_token_id": int(pad_token_id),
+        }
         
         # Encoder
         self.encoder = TransformerEncoder(
@@ -280,6 +293,7 @@ class MobileTranslationModel(nn.Module):
         src_attention_mask: Optional[torch.Tensor] = None,
         tgt_attention_mask: Optional[torch.Tensor] = None,
         label_smoothing: float = 0.0,
+        logits_chunk_size: Optional[int] = 1024,
     ) -> torch.Tensor:
         """
         Compute cross-entropy loss for training.
@@ -290,35 +304,60 @@ class MobileTranslationModel(nn.Module):
             src_attention_mask: Source attention mask
             tgt_attention_mask: Target attention mask
             label_smoothing: Label smoothing factor
+            logits_chunk_size: Maximum number of flattened target tokens to
+                project through the vocabulary head at once. The default keeps
+                peak training logits bounded for large vocabularies. Set to 0
+                or None to materialize all logits in one tensor.
 
         Returns:
             loss: Cross-entropy loss
         """
-        # Forward pass (exclude last token from input)
-        logits, _, _ = self.forward(
-            src_input_ids=src_input_ids,
-            tgt_input_ids=tgt_input_ids[:, :-1],
-            src_attention_mask=src_attention_mask,
-            tgt_attention_mask=tgt_attention_mask[:, :-1] if tgt_attention_mask is not None else None,
+        if tgt_input_ids.shape[1] < 2:
+            raise ValueError("tgt_input_ids must contain at least SOS and one label token")
+
+        encoder_output = self.encoder(
+            input_ids=src_input_ids,
+            attention_mask=src_attention_mask,
+        )
+        hidden_states, _ = self.decoder.forward_hidden(
+            input_ids=tgt_input_ids[:, :-1],
+            encoder_output=encoder_output,
+            self_attention_mask=(
+                tgt_attention_mask[:, :-1] if tgt_attention_mask is not None else None
+            ),
+            cross_attention_mask=src_attention_mask,
             use_cache=False,
         )
 
-        # Shift labels (exclude first token - SOS)
-        labels = tgt_input_ids[:, 1:].contiguous()
+        hidden_flat = hidden_states.reshape(-1, self.d_model)
+        labels = tgt_input_ids[:, 1:].reshape(-1)
+        total_tokens = hidden_flat.shape[0]
+        chunk_size = total_tokens if not logits_chunk_size else int(logits_chunk_size)
+        if chunk_size <= 0:
+            chunk_size = total_tokens
 
-        # Reshape for loss computation
-        logits = logits.view(-1, self.vocab_size)
-        labels = labels.view(-1)
+        if chunk_size >= total_tokens:
+            return F.cross_entropy(
+                self.decoder.lm_head(hidden_flat),
+                labels,
+                ignore_index=self.pad_token_id,
+                label_smoothing=label_smoothing,
+            )
 
-        # Compute loss with label smoothing
-        loss = F.cross_entropy(
-            logits,
-            labels,
-            ignore_index=self.pad_token_id,
-            label_smoothing=label_smoothing,
-        )
+        loss_sum = hidden_flat.new_zeros(())
+        for start in range(0, total_tokens, chunk_size):
+            end = min(start + chunk_size, total_tokens)
+            chunk_logits = self.decoder.lm_head(hidden_flat[start:end])
+            loss_sum = loss_sum + F.cross_entropy(
+                chunk_logits,
+                labels[start:end],
+                ignore_index=self.pad_token_id,
+                label_smoothing=label_smoothing,
+                reduction="sum",
+            )
 
-        return loss
+        valid_tokens = labels.ne(self.pad_token_id).sum().clamp_min(1)
+        return loss_sum / valid_tokens
     
     def count_parameters(self) -> Dict[str, int]:
         """
@@ -339,6 +378,10 @@ class MobileTranslationModel(nn.Module):
             'shared_embeddings': shared_embedding_params,
             'total': encoder_params + decoder_params - shared_embedding_params,
         }
+
+    def get_config(self) -> Dict[str, Any]:
+        """Return the exact constructor config required to rebuild this model."""
+        return dict(self._config)
     
     def generate_fast(
         self,
@@ -404,8 +447,10 @@ class MobileTranslationModel(nn.Module):
         eos_token_id: int = 2,
     ) -> torch.Tensor:
         """
-        Generate with beam search for higher quality translations.
-        Expected improvement: +2-4 BLEU points over greedy decoding.
+        Generate with beam search.
+
+        Quality is model- and dataset-dependent; tune ``length_penalty`` on a
+        validation set rather than assuming beam search beats greedy decoding.
 
         Args:
             src_input_ids: Source token IDs (batch, src_len)
@@ -432,6 +477,84 @@ class MobileTranslationModel(nn.Module):
             eos_token_id=eos_token_id,
             pad_token_id=self.pad_token_id,
         )
+
+
+def extract_model_state_dict(checkpoint: object) -> Dict[str, torch.Tensor]:
+    """Extract model weights from trainer, generic, or raw state-dict checkpoints."""
+    candidate: object = checkpoint
+    if isinstance(checkpoint, Mapping):
+        if "model_state_dict" in checkpoint:
+            candidate = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            candidate = checkpoint["state_dict"]
+
+    if not isinstance(candidate, Mapping) or not candidate:
+        raise ValueError(
+            "Checkpoint must be a non-empty state dict or contain "
+            "'model_state_dict'/'state_dict'."
+        )
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    for key, value in candidate.items():
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+            raise ValueError("Checkpoint state dict must map string keys to tensors.")
+        state_dict[key] = value
+
+    # torch.compile OptimizedModule checkpoints historically prefixed every
+    # parameter with "_orig_mod.". Normalize those files at the loader boundary.
+    if state_dict and all(key.startswith("_orig_mod.") for key in state_dict):
+        state_dict = {
+            key.removeprefix("_orig_mod."): value
+            for key, value in state_dict.items()
+        }
+
+    return state_dict
+
+
+def load_model_from_checkpoint(
+    checkpoint: object,
+    *,
+    fallback_vocab_size: Optional[int] = None,
+    fallback_model_size: str = "small",
+) -> MobileTranslationModel:
+    """Rebuild and strictly load a model from a checkpoint.
+
+    New trainer checkpoints include an exact ``config`` mapping. Legacy
+    checkpoints can still be loaded by supplying the preset and vocabulary
+    used to create them.
+    """
+    state_dict = extract_model_state_dict(checkpoint)
+
+    config: Optional[Mapping[str, Any]] = None
+    if isinstance(checkpoint, Mapping):
+        if checkpoint.get("quantization") is not None:
+            # Lazy import avoids a module cycle during package initialization.
+            from .quantization_utils import load_quantized_model_from_checkpoint
+
+            return load_quantized_model_from_checkpoint(checkpoint)
+        raw_config = checkpoint.get("config")
+        if raw_config is not None:
+            if not isinstance(raw_config, Mapping):
+                raise ValueError("Checkpoint 'config' must be a mapping.")
+            config = cast(Mapping[str, Any], raw_config)
+
+    if config is not None:
+        model = MobileTranslationModel(**dict(config))
+    else:
+        if fallback_vocab_size is None:
+            embedding = state_dict.get("encoder.embedding.weight")
+            if embedding is None or embedding.ndim != 2:
+                raise ValueError(
+                    "Legacy checkpoint has no model config; provide fallback_vocab_size."
+                )
+            fallback_vocab_size = int(embedding.shape[0])
+        model = create_model(
+            vocab_size=int(fallback_vocab_size),
+            model_size=fallback_model_size,
+        )
+
+    model.load_state_dict(state_dict, strict=True)
+    return model
 
 
 # FIXED: Add missing create_model function
@@ -523,6 +646,7 @@ def create_model(
         'dropout',
         'tie_embeddings',
         'pad_token_id',
+        'efficient_ffn',
     }
     unexpected = [k for k in kwargs.keys() if k not in allowed_override_keys]
     if unexpected:
@@ -533,7 +657,14 @@ def create_model(
     n_decoder_layers = int(cast(SupportsInt, kwargs.pop('n_decoder_layers', base['n_decoder_layers'])))
     n_heads = int(cast(SupportsInt, kwargs.pop('n_heads', base['n_heads'])))
     n_kv_heads = int(cast(SupportsInt, kwargs.pop('n_kv_heads', base['n_kv_heads'])))
+    explicit_d_ff = 'd_ff' in kwargs
     d_ff = int(cast(SupportsInt, kwargs.pop('d_ff', base['d_ff'])))
+    efficient_ffn = bool(kwargs.pop('efficient_ffn', False))
+    if efficient_ffn and not explicit_d_ff:
+        # SwiGLU has three projections, so ~8/3*d_model matches the parameter
+        # and FLOP budget of a conventional 4*d_model two-projection FFN.
+        multiple = 64
+        d_ff = ((8 * d_model + 3 * multiple - 1) // (3 * multiple)) * multiple
     max_seq_len = int(cast(SupportsInt, kwargs.pop('max_seq_len', base['max_seq_len'])))
     dropout = float(cast(SupportsFloat, kwargs.pop('dropout', base['dropout'])))
     tie_embeddings = bool(kwargs.pop('tie_embeddings', True))

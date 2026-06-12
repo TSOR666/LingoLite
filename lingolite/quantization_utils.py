@@ -7,7 +7,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, cast
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -26,8 +26,8 @@ except Exception as exc:  # pragma: no cover - exercised via runtime envs
     TORCHAO_AVAILABLE = False
     TORCHAO_IMPORT_ERROR = exc
 
-from .mobile_translation_model import MobileTranslationModel
-from .utils import logger
+from .mobile_translation_model import MobileTranslationModel, load_model_from_checkpoint
+from .utils import atomic_torch_save, logger
 
 
 STATIC_QUANTIZATION_SUPPORTED = False
@@ -183,6 +183,8 @@ def apply_dynamic_quantization(
 
     if dtype == torch.qint8:
         if _apply_torchao_dynamic_quantization(quantized_model):
+            quantized_model._quantization_method = "dynamic_int8"  # type: ignore[attr-defined]
+            quantized_model._quantization_backend = "torchao"  # type: ignore[attr-defined]
             logger.info("Dynamic quantization applied with torchao eager mode")
             return cast(MobileTranslationModel, quantized_model)
 
@@ -195,11 +197,15 @@ def apply_dynamic_quantization(
             quantized_model,
             replacement_fn=lambda linear: DynamicQuantizedLinear(linear),
         )
+        quantized_model._quantization_method = "dynamic_int8"  # type: ignore[attr-defined]
+        quantized_model._quantization_backend = "eager_int8_compat"  # type: ignore[attr-defined]
         logger.info("Dynamic quantization applied with eager INT8 compatibility fallback")
         return cast(MobileTranslationModel, quantized_model)
 
     if dtype == torch.float16:
         quantized_model = quantized_model.to(dtype=torch.float16)
+        quantized_model._quantization_method = "dynamic_fp16"  # type: ignore[attr-defined]
+        quantized_model._quantization_backend = "native_fp16"  # type: ignore[attr-defined]
         logger.info("Applied float16 reduced-precision fallback")
         return cast(MobileTranslationModel, quantized_model)
 
@@ -207,6 +213,79 @@ def apply_dynamic_quantization(
         f"Unsupported dynamic quantization dtype: {dtype}. "
         "Expected torch.qint8 or torch.float16."
     )
+
+
+def make_quantized_checkpoint(model: MobileTranslationModel) -> Dict[str, object]:
+    """Build a portable checkpoint for a model returned by quantization helpers."""
+    method = getattr(model, "_quantization_method", None)
+    backend = getattr(model, "_quantization_backend", None)
+    if not isinstance(method, str) or not isinstance(backend, str):
+        raise ValueError("Model has no quantization metadata; quantize it before saving.")
+
+    return {
+        "format_version": 1,
+        "config": model.get_config(),
+        "quantization": {
+            "method": method,
+            "backend": backend,
+        },
+        "model_state_dict": model.state_dict(),
+    }
+
+
+def save_quantized_checkpoint(
+    model: MobileTranslationModel,
+    output_path: Union[str, Path],
+) -> Path:
+    """Save a portable quantized checkpoint that can be strictly reconstructed."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_torch_save(make_quantized_checkpoint(model), path)
+    return path
+
+
+def load_quantized_model_from_checkpoint(
+    checkpoint: Mapping[str, object],
+) -> MobileTranslationModel:
+    """Rebuild a quantized model using the backend recorded in its checkpoint."""
+    config = checkpoint.get("config")
+    metadata = checkpoint.get("quantization")
+    state_dict = checkpoint.get("model_state_dict")
+    if not isinstance(config, Mapping):
+        raise ValueError("Quantized checkpoint is missing a model config mapping.")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("Quantized checkpoint is missing quantization metadata.")
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("Quantized checkpoint is missing model_state_dict.")
+
+    method = metadata.get("method")
+    expected_backend = metadata.get("backend")
+    if not isinstance(method, str) or not isinstance(expected_backend, str):
+        raise ValueError("Invalid quantization metadata.")
+
+    base_model = MobileTranslationModel(**dict(config))
+    if method == "dynamic_int8":
+        if expected_backend == "torchao" and not TORCHAO_AVAILABLE:
+            raise RuntimeError(
+                "This checkpoint requires the torchao INT8 backend, but torchao "
+                "is not installed."
+            )
+        model = apply_dynamic_quantization(base_model, dtype=torch.qint8)
+    elif method == "dynamic_fp16":
+        model = apply_dynamic_quantization(base_model, dtype=torch.float16)
+    else:
+        raise ValueError(f"Unsupported quantization method in checkpoint: {method!r}")
+
+    actual_backend = getattr(model, "_quantization_backend", None)
+    if actual_backend != expected_backend:
+        raise RuntimeError(
+            "Quantization backend mismatch: checkpoint requires "
+            f"{expected_backend!r}, runtime produced {actual_backend!r}."
+        )
+
+    model.load_state_dict(cast(Mapping[str, torch.Tensor], state_dict), strict=True)
+    model.eval()
+    return model
 
 
 def apply_static_quantization(
@@ -339,18 +418,11 @@ def compare_quantization_methods(
     # SECURITY: Use weights_only=True to prevent arbitrary code execution
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
 
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        model = MobileTranslationModel(**config)
-    else:
-        model = MobileTranslationModel(
-            vocab_size=24000,
-            d_model=512,
-            n_encoder_layers=6,
-            n_decoder_layers=6,
-        )
-
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = load_model_from_checkpoint(
+        checkpoint,
+        fallback_vocab_size=24000,
+        fallback_model_size="small",
+    )
     model.eval()
 
     results: Dict[str, Dict[str, object]] = {}
@@ -387,9 +459,9 @@ def compare_quantization_methods(
                 f"({results['dynamic_int8']['speedup']:.2f}x speedup)")
 
     # Save quantized model
-    torch.save(
-        dynamic_int8_model.state_dict(),
-        output_dir / 'model_dynamic_int8.pt'
+    save_quantized_checkpoint(
+        dynamic_int8_model,
+        output_dir / 'model_dynamic_int8.pt',
     )
 
     # Dynamic FP16
@@ -411,9 +483,9 @@ def compare_quantization_methods(
                     f"Speed: {dynamic_fp16_speed['mean_ms']:.2f} ms "
                     f"({results['dynamic_fp16']['speedup']:.2f}x speedup)")
 
-        torch.save(
-            dynamic_fp16_model.state_dict(),
-            output_dir / 'model_dynamic_fp16.pt'
+        save_quantized_checkpoint(
+            dynamic_fp16_model,
+            output_dir / 'model_dynamic_fp16.pt',
         )
     except Exception as e:
         logger.warning(f"FP16 quantization failed: {e}")
@@ -471,30 +543,30 @@ def main() -> None:
         # Load and quantize
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
         checkpoint = torch.load(args.model, map_location='cpu', weights_only=True)
-        if 'config' in checkpoint:
-            model = MobileTranslationModel(**checkpoint['config'])
-        else:
-            model = MobileTranslationModel(vocab_size=24000)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model = load_model_from_checkpoint(
+            checkpoint,
+            fallback_vocab_size=24000,
+            fallback_model_size="small",
+        )
 
         quantized = apply_dynamic_quantization(model, dtype=torch.qint8)
         output_path = args.output_dir / 'model_quantized_int8.pt'
-        torch.save(quantized.state_dict(), output_path)
+        save_quantized_checkpoint(quantized, output_path)
         logger.info(f"Quantized model saved to {output_path}")
 
     elif args.method == 'dynamic_fp16':
         # Load and quantize
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
         checkpoint = torch.load(args.model, map_location='cpu', weights_only=True)
-        if 'config' in checkpoint:
-            model = MobileTranslationModel(**checkpoint['config'])
-        else:
-            model = MobileTranslationModel(vocab_size=24000)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model = load_model_from_checkpoint(
+            checkpoint,
+            fallback_vocab_size=24000,
+            fallback_model_size="small",
+        )
 
         quantized = apply_dynamic_quantization(model, dtype=torch.float16)
         output_path = args.output_dir / 'model_quantized_fp16.pt'
-        torch.save(quantized.state_dict(), output_path)
+        save_quantized_checkpoint(quantized, output_path)
         logger.info(f"Quantized model saved to {output_path}")
 
 

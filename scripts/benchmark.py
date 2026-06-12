@@ -387,7 +387,9 @@ def _bench_decode(
         raise ValueError(f"Unknown decode scenario: {name}")
 
     with _cuda_memory_scope(device) as peak:
-        timings_s, _ = _time_iters(step, device=device, warmup=warmup, iters=iters)
+        timings_s, tokens_per_call = _time_iters(
+            step, device=device, warmup=warmup, iters=iters
+        )
 
     notes = [f"batch={batch_size}, src_len={src_len}, max_length={max_length}"]
     if name == "beam":
@@ -396,7 +398,7 @@ def _bench_decode(
     return _summarize(
         name,
         timings_s,
-        tokens_per_call=None,  # decode token count varies with EOS; report latency only
+        tokens_per_call=tokens_per_call,
         peak_memory_mb=peak(),
         variant=variant,
         model_size_mb=model_size_mb,

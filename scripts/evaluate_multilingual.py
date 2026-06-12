@@ -38,7 +38,7 @@ except ImportError:
     print("ERROR: sacrebleu not installed. Install with: pip install sacrebleu", file=sys.stderr)
     raise
 
-from lingolite.mobile_translation_model import MobileTranslationModel
+from lingolite.mobile_translation_model import MobileTranslationModel, load_model_from_checkpoint
 from lingolite.translation_tokenizer import TranslationTokenizer
 
 
@@ -113,20 +113,11 @@ def _load_model(checkpoint_path: Path, tokenizer: TranslationTokenizer, device: 
     """Reconstruct the model from a checkpoint, falling back to a sensible default."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
-    config = checkpoint.get("config") if isinstance(checkpoint, dict) else None
-    if config is not None:
-        model = MobileTranslationModel(**config)
-    else:
-        # Older checkpoints without an embedded config: default to ``small``-like
-        # architecture and let the state-dict load fail loudly if the shapes
-        # don't match.
-        model = MobileTranslationModel(
-            vocab_size=tokenizer.get_vocab_size(),
-            d_model=512,
-            n_encoder_layers=6,
-            n_decoder_layers=6,
-        )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = load_model_from_checkpoint(
+        checkpoint,
+        fallback_vocab_size=tokenizer.get_vocab_size(),
+        fallback_model_size="small",
+    )
     model.to(device)
     model.eval()
     return model
