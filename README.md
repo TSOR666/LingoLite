@@ -79,10 +79,10 @@ See [`docs/reports/OPEN_SOURCE_READINESS_REPORT.md`](docs/reports/OPEN_SOURCE_RE
   - Model quantization (INT8) utilities and ONNX export scripts
   - BLEU evaluation scripts (untested on real data)
 
-- **Flexible Model Sizes**:
-  - **Tiny**: ~7M parameters (~30MB FP32, ~7.5MB INT8)
-  - **Small**: ~60M parameters (~240MB FP32, ~60MB INT8)
-  - **Medium**: ~140M parameters (~560MB FP32, ~140MB INT8)
+- **Flexible Model Sizes** (parameter counts at the default 24k vocabulary; embeddings are shared encoder/decoder/LM-head):
+  - **Tiny**: ~14.8M parameters (~59MB FP32, ~15MB INT8) — 41% of parameters are the shared embedding table
+  - **Small**: ~61.9M parameters (~248MB FP32, ~62MB INT8)
+  - **Medium**: ~169.5M parameters (~678MB FP32, ~170MB INT8)
 
 ## Recent Updates
 

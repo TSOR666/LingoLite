@@ -13,6 +13,31 @@ if TYPE_CHECKING:
     from .generation_utils import KVCache
 
 
+def _probe_sdpa_gqa_support() -> bool:
+    """Return True when F.scaled_dot_product_attention accepts ``enable_gqa``.
+
+    The kwarg only exists on torch >= 2.5. Probing once at import time lets
+    GroupedQueryAttention.forward branch on a bool instead of raising and
+    catching a TypeError on every attention call (the failed call costs
+    ~0.2 ms per invocation, multiplied by layers x steps during decoding).
+    """
+    if not hasattr(F, "scaled_dot_product_attention"):
+        return False
+    try:
+        q = torch.zeros(1, 2, 1, 2)
+        kv = torch.zeros(1, 1, 1, 2)
+        F.scaled_dot_product_attention(q, kv, kv, enable_gqa=True)
+        return True
+    except TypeError:
+        return False
+    except Exception:
+        # Any other failure: fall back to the manual repeat path for safety.
+        return False
+
+
+_SDPA_SUPPORTS_GQA = _probe_sdpa_gqa_support()
+
+
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization.
@@ -405,16 +430,16 @@ class GroupedQueryAttention(nn.Module):
         dropout_p = self.dropout_p if self.training else 0.0
 
         if hasattr(F, "scaled_dot_product_attention"):
-            try:
+            if _SDPA_SUPPORTS_GQA and self.n_rep > 1:
                 output = F.scaled_dot_product_attention(
                     Q,
                     K,
                     V,
                     attn_mask=valid_mask,
                     dropout_p=dropout_p,
-                    enable_gqa=self.n_rep > 1,
+                    enable_gqa=True,
                 )
-            except TypeError:
+            else:
                 K_for_scores = K.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else K
                 V_for_scores = V.repeat_interleave(self.n_rep, dim=1) if self.n_rep > 1 else V
                 output = F.scaled_dot_product_attention(

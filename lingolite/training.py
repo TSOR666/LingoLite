@@ -4,6 +4,7 @@ Complete pipeline from data to trained model
 """
 
 import argparse
+import functools
 import json
 import logging
 import sys
@@ -460,6 +461,9 @@ class TranslationTrainer:
         loss_for_backward = loss if accum == 1 else loss / accum
 
         # Backward pass (scaled for fp16 to avoid underflow).
+        # ``grad_norm`` stays a plain float on mid-cycle micro-steps so the
+        # metrics dict below costs no extra device->host sync for them.
+        grad_norm_value = 0.0
         if self._use_grad_scaler and self.scaler is not None:
             self.scaler.scale(loss_for_backward).backward()
             if is_last_micro:
@@ -469,11 +473,9 @@ class TranslationTrainer:
                     max_norm=self.gradient_clip,
                     norm_type=2.0,
                 )
+                grad_norm_value = float(grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-            else:
-                # Mid-cycle: gradients keep accumulating, no clip / step yet.
-                grad_norm = torch.zeros((), device=self.device)
         else:
             loss_for_backward.backward()  # type: ignore[no-untyped-call]
             if is_last_micro:
@@ -482,9 +484,8 @@ class TranslationTrainer:
                     max_norm=self.gradient_clip,
                     norm_type=2.0,
                 )
+                grad_norm_value = float(grad_norm)
                 self.optimizer.step()
-            else:
-                grad_norm = torch.zeros((), device=self.device)
 
         if is_last_micro:
             self.scheduler.step()
@@ -493,13 +494,15 @@ class TranslationTrainer:
         else:
             self._micro_step_in_cycle += 1
 
+        # Sync the loss to host exactly once (it was previously read twice).
+        loss_value = loss.item()
         metrics = {
-            'loss': loss.item(),
-            'grad_norm': grad_norm.item(),
+            'loss': loss_value,
+            'grad_norm': grad_norm_value,
             'lr': self.scheduler.get_last_lr()[0],
         }
 
-        return loss.item(), metrics
+        return loss_value, metrics
     
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
@@ -558,10 +561,19 @@ class TranslationTrainer:
     
     def save_checkpoint(self, filename: str) -> None:
         """Save model checkpoint with RNG state for deterministic resume."""
+        # Drop non-serializable entries from the scheduler state. On torch < 2.4
+        # OneCycleLR.state_dict() contains ``anneal_func`` (a bound method),
+        # which torch.load(..., weights_only=True) refuses to unpickle —
+        # breaking every checkpoint reload. The fresh scheduler instance
+        # already has the callable, so omitting it from the saved state is
+        # lossless (LRScheduler.load_state_dict only updates the keys present).
+        scheduler_state = {
+            k: v for k, v in self.scheduler.state_dict().items() if not callable(v)
+        }
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': scheduler_state,
             'global_step': self.global_step,
             'best_val_loss': self.best_val_loss,
             # RNG state tensors are plain ByteTensors and are compatible with
@@ -842,13 +854,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"[OK] Loaded {len(val_data)} validation examples")
 
         val_dataset = TranslationDataset(val_data, tokenizer, max_length=args.max_length)
+        # functools.partial of a module-level function is picklable; a lambda is
+        # not, and crashes DataLoader workers on spawn-based platforms (Windows,
+        # macOS) whenever --num-workers > 0.
         val_loader = cast(
             DataLoader[Dict[str, torch.Tensor]],
             DataLoader(
                 val_dataset,
                 batch_size=args.batch_size,
                 shuffle=False,
-                collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+                collate_fn=functools.partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
                 **dataloader_kwargs,
             ),
         )
@@ -862,7 +877,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+            collate_fn=functools.partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
             **dataloader_kwargs,
         ),
     )
