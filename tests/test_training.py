@@ -440,6 +440,42 @@ class TestTranslationTrainer:
             assert not (tmpdir / "checkpoint_step_0.pt").exists()
             assert (tmpdir / "checkpoint_step_1.pt").exists()
 
+    def test_train_flushes_final_partial_accumulation_cycle(
+        self, tiny_model: MobileTranslationModel
+    ) -> None:
+        """A short loader should still produce one correctly normalized step."""
+        batch = {
+            'src_input_ids': torch.randint(0, 100, (2, 10)),
+            'tgt_input_ids': torch.randint(0, 100, (2, 8)),
+            'src_attention_mask': torch.ones(2, 10),
+            'tgt_attention_mask': torch.ones(2, 8),
+        }
+
+        with writable_tmp_dir("trainer_partial_accum_") as tmpdir:
+            trainer = TranslationTrainer(
+                model=tiny_model,
+                train_loader=[batch],
+                device='cpu',
+                save_dir=str(tmpdir),
+                max_steps=2,
+                warmup_steps=0,
+                gradient_accumulation_steps=4,
+            )
+            initial_parameters = {
+                name: parameter.detach().clone()
+                for name, parameter in tiny_model.named_parameters()
+            }
+
+            trainer.train(num_epochs=1, eval_steps=99, save_steps=1, log_steps=1)
+
+            assert trainer.global_step == 1
+            assert trainer._micro_step_in_cycle == 0
+            assert (tmpdir / "checkpoint_step_1.pt").exists()
+            assert any(
+                not torch.equal(initial_parameters[name], parameter)
+                for name, parameter in tiny_model.named_parameters()
+            )
+
 
 # ============================================================================
 # Loss Computation Tests  

@@ -509,33 +509,14 @@ class TranslationTrainer:
         grad_norm_value = 0.0
         if self._use_grad_scaler and self.scaler is not None:
             self.scaler.scale(loss_for_backward).backward()
-            if is_last_micro:
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.gradient_clip,
-                    norm_type=2.0,
-                )
-                if sync_metrics:
-                    grad_norm_value = float(grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
         else:
             loss_for_backward.backward()  # type: ignore[no-untyped-call]
-            if is_last_micro:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.gradient_clip,
-                    norm_type=2.0,
-                )
-                if sync_metrics:
-                    grad_norm_value = float(grad_norm)
-                self.optimizer.step()
 
         if is_last_micro:
-            self.scheduler.step()
-            self.global_step += 1
-            self._micro_step_in_cycle = 0
+            grad_norm_value = self._apply_accumulated_gradients(
+                accumulated_micro_batches=accum,
+                sync_metrics=sync_metrics,
+            )
         else:
             self._micro_step_in_cycle += 1
 
@@ -556,6 +537,50 @@ class TranslationTrainer:
         }
 
         return loss_value, metrics
+
+    def _apply_accumulated_gradients(
+        self,
+        accumulated_micro_batches: int,
+        sync_metrics: bool,
+    ) -> float:
+        """Apply one optimizer step from the gradients currently buffered.
+
+        Every micro-batch loss is divided by the configured accumulation
+        factor in :meth:`train_step`. When training ends partway through a
+        cycle, rescale those gradients so the partial cycle is still averaged
+        over the number of micro-batches it actually contains.
+        """
+        if not 1 <= accumulated_micro_batches <= self.gradient_accumulation_steps:
+            raise ValueError(
+                "accumulated_micro_batches must be between 1 and "
+                f"{self.gradient_accumulation_steps}, got {accumulated_micro_batches}"
+            )
+
+        if self._use_grad_scaler and self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+
+        normalization = self.gradient_accumulation_steps / accumulated_micro_batches
+        if normalization != 1.0:
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(normalization)
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            max_norm=self.gradient_clip,
+            norm_type=2.0,
+        )
+
+        if self._use_grad_scaler and self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        self.scheduler.step()
+        self.global_step += 1
+        self._micro_step_in_cycle = 0
+        return float(grad_norm) if sync_metrics else 0.0
 
     def _consume_deferred_loss(self) -> float:
         """Return the deferred mean loss with one device-to-host sync."""
@@ -758,6 +783,38 @@ class TranslationTrainer:
                 # Save checkpoint
                 if did_optimizer_step and self.global_step % save_steps == 0:
                     self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
+
+        # The loader may end before a complete accumulation cycle. Apply the
+        # remaining gradients instead of silently discarding those samples.
+        if self._micro_step_in_cycle > 0 and self.global_step < self.max_steps:
+            partial_micro_batches = self._micro_step_in_cycle
+            self._apply_accumulated_gradients(
+                accumulated_micro_batches=partial_micro_batches,
+                sync_metrics=False,
+            )
+            print(
+                f"\n[OK] Flushed final partial accumulation cycle "
+                f"({partial_micro_batches}/{self.gradient_accumulation_steps} micro-batches)"
+            )
+
+            if self.global_step % log_steps == 0:
+                avg_loss = self._consume_deferred_loss()
+                print(
+                    f"  Step {self.global_step} - Loss: {avg_loss:.4f}, "
+                    f"LR: {self.scheduler.get_last_lr()[0]:.2e}"
+                )
+
+            if self.global_step % eval_steps == 0 and self.val_loader is not None:
+                val_metrics = self.evaluate()
+                print(f"\nStep {self.global_step} - Validation:")
+                print(f"  Loss: {val_metrics['val_loss']:.4f}")
+                print(f"  Perplexity: {val_metrics['perplexity']:.2f}")
+                if val_metrics['val_loss'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['val_loss']
+                    self.save_checkpoint('best_model.pt')
+
+            if self.global_step % save_steps == 0:
+                self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
 
         print(f"\n{'='*80}")
         print("[OK] TRAINING COMPLETE")
