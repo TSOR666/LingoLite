@@ -25,7 +25,7 @@ def _require_sacrebleu() -> None:
             "sacrebleu not installed. Install with: pip install sacrebleu"
         )
 
-from lingolite.mobile_translation_model import MobileTranslationModel, create_model
+from lingolite.mobile_translation_model import MobileTranslationModel, load_model_from_checkpoint
 from lingolite.translation_tokenizer import TranslationTokenizer
 from lingolite.utils import logger
 
@@ -279,20 +279,11 @@ def evaluate_model(
     logger.info(f"Loading model from {model_path}")
     checkpoint = torch.load(model_path, map_location=device_obj, weights_only=True)
 
-    # Extract config from checkpoint
-    if isinstance(checkpoint, dict) and 'config' in checkpoint:
-        config = checkpoint['config']
-        model = MobileTranslationModel(**config)
-    else:
-        # Assume default config
-        model = MobileTranslationModel(
-            vocab_size=tokenizer.get_vocab_size(),
-            d_model=512,
-            n_encoder_layers=6,
-            n_decoder_layers=6,
-        )
-
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = load_model_from_checkpoint(
+        checkpoint,
+        fallback_vocab_size=tokenizer.get_vocab_size(),
+        fallback_model_size="small",
+    )
     model.to(device_obj)
     model.eval()
 

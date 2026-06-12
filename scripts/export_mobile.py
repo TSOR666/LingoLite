@@ -16,6 +16,30 @@ from typing import Optional
 import torch
 
 
+class LogitsOnlyWrapper(torch.nn.Module):
+    """Expose only logits from MobileTranslationModel's tuple return."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        src_input_ids: torch.Tensor,
+        tgt_input_ids: torch.Tensor,
+        src_attention_mask: Optional[torch.Tensor],
+        tgt_attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        logits, _, _ = self.model(
+            src_input_ids=src_input_ids,
+            tgt_input_ids=tgt_input_ids,
+            src_attention_mask=src_attention_mask,
+            tgt_attention_mask=tgt_attention_mask,
+            use_cache=False,
+        )
+        return logits
+
+
 def export_to_onnx(
     model: torch.nn.Module,
     src_input_ids: torch.Tensor,
@@ -29,6 +53,8 @@ def export_to_onnx(
     """Export the full model forward pass to ONNX."""
 
     model.eval()
+    export_model = LogitsOnlyWrapper(model)
+    export_model.eval()
 
     inputs = (
         src_input_ids,
@@ -56,7 +82,7 @@ def export_to_onnx(
         }
 
     torch.onnx.export(
-        model,
+        export_model,
         inputs,
         f=str(output_path),
         opset_version=opset,
@@ -157,14 +183,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    from lingolite.mobile_translation_model import create_model
+    from lingolite.mobile_translation_model import load_model_from_checkpoint
 
-    model = create_model(vocab_size=args.vocab_size, model_size=args.model_size)
     # SECURITY: Use weights_only=True to prevent arbitrary code execution
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        checkpoint = checkpoint["state_dict"]
-    model.load_state_dict(checkpoint, strict=False)
+    model = load_model_from_checkpoint(
+        checkpoint,
+        fallback_vocab_size=args.vocab_size,
+        fallback_model_size=args.model_size,
+    )
 
     batch_size = 1
     src_input_ids = torch.ones(batch_size, args.src_len, dtype=torch.long)

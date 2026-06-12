@@ -22,7 +22,7 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 
 from .mobile_translation_model import MobileTranslationModel, create_model
 from .translation_tokenizer import TranslationTokenizer
-from .utils import setup_logger
+from .utils import atomic_torch_save, setup_logger
 
 # Set up logger
 logger = setup_logger(name="lingolite_training", level=logging.INFO)
@@ -38,21 +38,33 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
         data: List[Dict[str, str]],
         tokenizer: TranslationTokenizer,
         max_length: int = 128,
+        pretokenize: bool = False,
     ):
         """
         Args:
             data: List of dicts with 'src_text', 'tgt_text', 'src_lang', 'tgt_lang'
             tokenizer: TranslationTokenizer instance
             max_length: Maximum sequence length
+            pretokenize: Encode every example once during construction. This
+                trades host memory and startup time for lower per-epoch CPU
+                overhead, and is useful when the same corpus is revisited.
         """
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self._encoded_data: Optional[List[Dict[str, List[int]]]] = None
+        if pretokenize:
+            self._encoded_data = [self._encode_item(i) for i in range(len(self.data))]
         
     def __len__(self) -> int:
         return len(self.data)
     
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
+        if self._encoded_data is not None:
+            return {key: list(value) for key, value in self._encoded_data[idx].items()}
+        return self._encode_item(idx)
+
+    def _encode_item(self, idx: int) -> Dict[str, List[int]]:
         item = self.data[idx]
 
         # Validate required fields
@@ -213,6 +225,7 @@ class TranslationTrainer:
         compile_model: bool = False,
         gradient_accumulation_steps: int = 1,
         gradient_checkpointing: bool = False,
+        loss_chunk_size: Optional[int] = 1024,
     ):
         """
         Args:
@@ -244,6 +257,9 @@ class TranslationTrainer:
                 ~30% extra compute for substantially lower training-time
                 activation memory. Only active when ``model.training`` is True
                 so inference paths (greedy/beam) are unaffected.
+            loss_chunk_size: Maximum flattened target-token count projected
+                through the vocabulary head at once. Set to 0 or None to
+                disable chunking.
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -372,6 +388,13 @@ class TranslationTrainer:
 
         self.gradient_clip = gradient_clip
         self.label_smoothing = label_smoothing
+        if loss_chunk_size is not None and loss_chunk_size < 0:
+            raise ValueError(
+                f"loss_chunk_size must be non-negative or None, got {loss_chunk_size}"
+            )
+        self.loss_chunk_size = loss_chunk_size
+        self._deferred_loss_sum: Optional[torch.Tensor] = None
+        self._deferred_loss_count = 0
 
         if gradient_accumulation_steps < 1:
             raise ValueError(
@@ -399,8 +422,23 @@ class TranslationTrainer:
 
         self.global_step = 0
         self.best_val_loss = float('inf')
+
+    def _checkpoint_model(self) -> MobileTranslationModel:
+        """Return the underlying model when torch.compile wrapped it."""
+        model = self.model
+        while hasattr(model, "_orig_mod"):
+            model = model._orig_mod  # type: ignore[attr-defined,assignment]
+        if not isinstance(model, MobileTranslationModel):
+            raise TypeError(
+                f"Expected MobileTranslationModel, got {type(model).__name__}"
+            )
+        return model
         
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, float]]:
+    def train_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        sync_metrics: bool = True,
+    ) -> Tuple[float, Dict[str, float]]:
         """
         Single training step.
 
@@ -413,6 +451,9 @@ class TranslationTrainer:
 
         Args:
             batch: Batch of data
+            sync_metrics: Convert loss and gradient norm to host floats. The
+                main training loop disables this between log intervals to
+                avoid a CUDA synchronization on every micro-batch.
 
         Returns:
             loss: Per-micro-batch loss (unscaled, for logging)
@@ -445,6 +486,7 @@ class TranslationTrainer:
                     src_attention_mask=batch['src_attention_mask'],
                     tgt_attention_mask=batch['tgt_attention_mask'],
                     label_smoothing=self.label_smoothing,
+                    logits_chunk_size=self.loss_chunk_size,
                 )
         else:
             loss = self.model.compute_loss(
@@ -453,6 +495,7 @@ class TranslationTrainer:
                 src_attention_mask=batch['src_attention_mask'],
                 tgt_attention_mask=batch['tgt_attention_mask'],
                 label_smoothing=self.label_smoothing,
+                logits_chunk_size=self.loss_chunk_size,
             )
 
         # Scale the loss so summed gradients across the cycle equal the mean
@@ -473,7 +516,8 @@ class TranslationTrainer:
                     max_norm=self.gradient_clip,
                     norm_type=2.0,
                 )
-                grad_norm_value = float(grad_norm)
+                if sync_metrics:
+                    grad_norm_value = float(grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
         else:
@@ -484,7 +528,8 @@ class TranslationTrainer:
                     max_norm=self.gradient_clip,
                     norm_type=2.0,
                 )
-                grad_norm_value = float(grad_norm)
+                if sync_metrics:
+                    grad_norm_value = float(grad_norm)
                 self.optimizer.step()
 
         if is_last_micro:
@@ -494,8 +539,16 @@ class TranslationTrainer:
         else:
             self._micro_step_in_cycle += 1
 
-        # Sync the loss to host exactly once (it was previously read twice).
-        loss_value = loss.item()
+        if sync_metrics:
+            loss_value = loss.item()
+        else:
+            detached_loss = loss.detach().float()
+            if self._deferred_loss_sum is None:
+                self._deferred_loss_sum = detached_loss.clone()
+            else:
+                self._deferred_loss_sum.add_(detached_loss)
+            self._deferred_loss_count += 1
+            loss_value = 0.0
         metrics = {
             'loss': loss_value,
             'grad_norm': grad_norm_value,
@@ -503,6 +556,16 @@ class TranslationTrainer:
         }
 
         return loss_value, metrics
+
+    def _consume_deferred_loss(self) -> float:
+        """Return the deferred mean loss with one device-to-host sync."""
+        if self._deferred_loss_sum is None or self._deferred_loss_count == 0:
+            return 0.0
+        mean_loss = self._deferred_loss_sum / self._deferred_loss_count
+        value = float(mean_loss.item())
+        self._deferred_loss_sum = None
+        self._deferred_loss_count = 0
+        return value
     
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
@@ -570,8 +633,10 @@ class TranslationTrainer:
         scheduler_state = {
             k: v for k, v in self.scheduler.state_dict().items() if not callable(v)
         }
+        checkpoint_model = self._checkpoint_model()
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
+            'config': checkpoint_model.get_config(),
+            'model_state_dict': checkpoint_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': scheduler_state,
             'global_step': self.global_step,
@@ -580,13 +645,15 @@ class TranslationTrainer:
             # torch.load(..., weights_only=True).
             'torch_rng_state': torch.get_rng_state(),
         }
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         if torch.cuda.is_available():
             checkpoint['torch_cuda_rng_state'] = torch.cuda.get_rng_state_all()
 
         checkpoint_path = Path(filename)
         save_path = checkpoint_path if checkpoint_path.is_absolute() else self.save_dir / checkpoint_path
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, save_path)
+        atomic_torch_save(checkpoint, save_path)
         print(f"[OK] Checkpoint saved: {save_path}")
 
     def load_checkpoint(self, filename: str) -> None:
@@ -596,9 +663,12 @@ class TranslationTrainer:
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
         checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self._checkpoint_model().load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler_state = checkpoint.get('scaler_state_dict')
+        if scaler_state is not None and self.scaler is not None:
+            self.scaler.load_state_dict(scaler_state)
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
 
@@ -635,8 +705,8 @@ class TranslationTrainer:
         print("=" * 80)
         print(f"Max steps: {self.max_steps}")
 
-        running_loss: float = 0.0
-        running_loss_count = 0
+        self._deferred_loss_sum = None
+        self._deferred_loss_count = 0
         training_complete = False
 
         for epoch in range(num_epochs):
@@ -657,21 +727,17 @@ class TranslationTrainer:
                     break
 
                 previous_global_step = self.global_step
-                loss, metrics = self.train_step(batch)
-                running_loss += loss
-                running_loss_count += 1
+                _, metrics = self.train_step(batch, sync_metrics=False)
                 did_optimizer_step = self.global_step > previous_global_step
 
                 # Update progress bar
                 if did_optimizer_step and self.global_step % log_steps == 0:
-                    avg_loss = running_loss / max(1, running_loss_count)
+                    avg_loss = self._consume_deferred_loss()
                     progress_bar.set_postfix({
                         'loss': f"{avg_loss:.4f}",
                         'lr': f"{metrics['lr']:.2e}",
                         'step': self.global_step,
                     })
-                    running_loss = 0
-                    running_loss_count = 0
 
                 # Evaluation
                 if (
@@ -734,6 +800,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='DataLoader prefetch factor when --num-workers > 0')
     parser.add_argument('--max-length', type=int, default=128,
                         help='Maximum sequence length')
+    parser.add_argument('--pretokenize', action='store_true',
+                        help='Encode the dataset once at startup instead of every epoch')
     parser.add_argument('--num-epochs', type=int, default=10,
                         help='Number of training epochs')
     parser.add_argument('--max-steps', type=int, default=100000,
@@ -774,6 +842,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='Enable autocast mixed precision. fp16 requires CUDA; bf16 works on Ampere+ CUDA or CPU')
     parser.add_argument('--compile', dest='compile_model', action='store_true',
                         help='Wrap the model in torch.compile for kernel fusion')
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                        help='Accumulate gradients across this many micro-batches')
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Recompute layer activations during backward to reduce memory')
+    parser.add_argument('--loss-chunk-size', type=int, default=1024,
+                        help='Flattened target tokens per vocabulary projection chunk (0 disables)')
+    parser.add_argument('--efficient-ffn', action='store_true',
+                        help='Use compute-matched SwiGLU width (~8/3*d_model) for new models')
 
     return parser
 
@@ -853,7 +929,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             val_data = json.load(f)
         print(f"[OK] Loaded {len(val_data)} validation examples")
 
-        val_dataset = TranslationDataset(val_data, tokenizer, max_length=args.max_length)
+        val_dataset = TranslationDataset(
+            val_data,
+            tokenizer,
+            max_length=args.max_length,
+            pretokenize=args.pretokenize,
+        )
         # functools.partial of a module-level function is picklable; a lambda is
         # not, and crashes DataLoader workers on spawn-based platforms (Windows,
         # macOS) whenever --num-workers > 0.
@@ -870,7 +951,12 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # Create datasets
     print("\nCreating datasets...")
-    train_dataset = TranslationDataset(train_data, tokenizer, max_length=args.max_length)
+    train_dataset = TranslationDataset(
+        train_data,
+        tokenizer,
+        max_length=args.max_length,
+        pretokenize=args.pretokenize,
+    )
     train_loader = cast(
         DataLoader[Dict[str, torch.Tensor]],
         DataLoader(
@@ -894,7 +980,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # Create model
     print(f"\nCreating model (size={args.model_size})...")
-    model = create_model(vocab_size=vocab_size, model_size=args.model_size)
+    model = create_model(
+        vocab_size=vocab_size,
+        model_size=args.model_size,
+        efficient_ffn=args.efficient_ffn,
+    )
     params = model.count_parameters()
     print(f"[OK] Model created: {params['total']/1e6:.1f}M parameters")
 
@@ -914,6 +1004,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         save_dir=args.save_dir,
         amp_dtype=args.amp_dtype,
         compile_model=args.compile_model,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_checkpointing=args.gradient_checkpointing,
+        loss_chunk_size=args.loss_chunk_size,
     )
     print("[OK] Trainer ready")
 

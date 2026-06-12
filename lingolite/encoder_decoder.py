@@ -374,7 +374,7 @@ class TransformerDecoder(nn.Module):
         # (the KV-cache mutation pattern doesn't survive checkpoint's recompute).
         self.gradient_checkpointing: bool = False
 
-    def forward(
+    def forward_hidden(
         self,
         input_ids: torch.Tensor,
         encoder_output: torch.Tensor,
@@ -393,7 +393,7 @@ class TransformerDecoder(nn.Module):
             use_cache: Whether to return updated cache
 
         Returns:
-            logits: (batch, tgt_len, vocab_size)
+            hidden_states: (batch, tgt_len, d_model)
             updated_caches: List of LayerKVCache if use_cache=True, else None
         """
         # Embed tokens (use cached scaling factor)
@@ -470,10 +470,32 @@ class TransformerDecoder(nn.Module):
                     raise ValueError("Decoder layer did not return cache while use_cache=True")
                 updated_caches.append(new_cache)
 
-        # Final normalization and projection
+        # Final normalization. Keeping the vocabulary projection separate lets
+        # the training loss project bounded token chunks instead of allocating
+        # the full (batch, sequence, vocabulary) logits tensor.
         x = self.final_norm(x)
-        logits = self.lm_head(x)
 
+        return x, updated_caches
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        encoder_output: torch.Tensor,
+        self_attention_mask: Optional[torch.Tensor] = None,
+        cross_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List['LayerKVCache']] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[List['LayerKVCache']]]:
+        """Decode tokens and project hidden states to vocabulary logits."""
+        hidden_states, updated_caches = self.forward_hidden(
+            input_ids=input_ids,
+            encoder_output=encoder_output,
+            self_attention_mask=self_attention_mask,
+            cross_attention_mask=cross_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        logits = self.lm_head(hidden_states)
         return logits, updated_caches
 
 

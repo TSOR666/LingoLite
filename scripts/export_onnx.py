@@ -18,7 +18,7 @@ except ImportError:
     print("WARNING: ONNX not installed. Install with: pip install onnx onnxruntime")
     ONNX_AVAILABLE = False
 
-from lingolite.mobile_translation_model import MobileTranslationModel
+from lingolite.mobile_translation_model import MobileTranslationModel, load_model_from_checkpoint
 from lingolite.translation_tokenizer import TranslationTokenizer
 from lingolite.utils import logger
 
@@ -502,21 +502,12 @@ def export_full_model(
     # SECURITY: Use weights_only=True to prevent arbitrary code execution
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
 
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        model = MobileTranslationModel(**config)
-        d_model = config.get('d_model', 512)
-    else:
-        # Default config
-        model = MobileTranslationModel(
-            vocab_size=24000,
-            d_model=512,
-            n_encoder_layers=6,
-            n_decoder_layers=6,
-        )
-        d_model = 512
-
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = load_model_from_checkpoint(
+        checkpoint,
+        fallback_vocab_size=24000,
+        fallback_model_size="small",
+    )
+    d_model = model.d_model
     model.eval()
 
     logger.info(f"Model loaded: {model.count_parameters()['total']:,} parameters")

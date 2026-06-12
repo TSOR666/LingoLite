@@ -260,7 +260,23 @@ class LayerKVCache:
         """
         self.self_attn_cache.reorder(beam_indices)
         if not self_only:
-            self.cross_attn_cache.reorder(beam_indices)
+            cross_key = self.cross_attn_cache.key
+            if cross_key is not None and cross_key.shape[0] != beam_indices.numel():
+                source_batch = cross_key.shape[0]
+                if beam_indices.numel() % source_batch != 0:
+                    raise ValueError(
+                        "Beam indices are incompatible with the shared cross-attention cache"
+                    )
+                beams_per_source = beam_indices.numel() // source_batch
+                grouped_indices = beam_indices.view(source_batch, beams_per_source)
+                source_indices = torch.div(
+                    grouped_indices[:, 0],
+                    beams_per_source,
+                    rounding_mode="floor",
+                )
+                self.cross_attn_cache.reorder(source_indices)
+            else:
+                self.cross_attn_cache.reorder(beam_indices)
         return self
 
 
@@ -788,8 +804,11 @@ def generate_with_beam_search(
     pad_token_id: int = 0,
 ) -> torch.Tensor:
     """
-    Generate translation with beam search for higher quality.
-    Expected improvement: +2-4 BLEU points over greedy decoding.
+    Generate translation with beam search.
+
+    Beam search can improve corpus-level quality for a calibrated model, but it
+    can also prefer short hypotheses. Tune ``length_penalty`` on validation
+    data and compare against greedy decoding before deployment.
 
     **Performance Note**: This recomputes the full decoder sequence at each
     step (O(n²) per beam). Use ``generate_with_kv_cache`` for O(n) greedy.
@@ -863,25 +882,9 @@ def _generate_with_beam_search_impl(
             attention_mask=src_attention_mask,
         )
         
-        # Expand for beams
-        encoder_output = encoder_output.unsqueeze(1).repeat(1, num_beams, 1, 1)
-        # (B, src_len, d_model) -> (B, 1, src_len, d_model) -> (B, num_beams, src_len, d_model)
-        encoder_output = encoder_output.view(batch_size * num_beams, -1, encoder_output.shape[-1])
-        # (B, num_beams, src_len, d_model) -> (B*num_beams, src_len, d_model)
-        
-        if src_attention_mask is not None:
-            src_attention_mask = src_attention_mask.unsqueeze(1).repeat(1, num_beams, 1)
-            src_attention_mask = src_attention_mask.view(batch_size * num_beams, -1)
-        
-        # Initialize beam search
-        beam_scorer = BeamSearchScorer(
-            batch_size=batch_size,
-            num_beams=num_beams,
-            device=device,
-            length_penalty=length_penalty,
-            early_stopping=early_stopping,
-            eos_token_id=eos_token_id,
-        )
+        # Cross-attention broadcasts the source batch across each beam group.
+        # Encoder activations, source masks, and cross-attention KV caches
+        # therefore remain at batch size B instead of B * num_beams.
         
         # Start with SOS token for all beams
         input_ids = torch.full(
@@ -892,9 +895,20 @@ def _generate_with_beam_search_impl(
         )
         
         # Initialize beam scores (0 for first beam of each batch, -inf for others)
-        beam_scores = torch.full((batch_size * num_beams,), float('-inf'), device=device)
-        # Activate first beam of each batch (indices 0, num_beams, 2*num_beams, ...)
-        beam_scores[::num_beams] = 0.0
+        beam_scores = torch.full(
+            (batch_size, num_beams), float("-inf"), device=device
+        )
+        beam_scores[:, 0] = 0.0
+
+        # Completed hypotheses stay on-device throughout decoding.
+        finished_scores = torch.full_like(beam_scores, float("-inf"))
+        finished_sequences = torch.full(
+            (batch_size, num_beams, max_length),
+            eos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        done = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         # Pre-allocate self-attention KV cache buffers per-beam. Cross-attention
         # is populated once on the first decoder call and never grows.
@@ -909,11 +923,6 @@ def _generate_with_beam_search_impl(
         # Per-step self-attention mask is a single valid token per beam;
         # pre-allocate once to avoid a fresh ``ones_like`` every step.
         tgt_mask = torch.ones(batch_size * num_beams, 1, dtype=torch.bool, device=device)
-
-        # Python-side done state. The scorer keeps a device tensor as part of
-        # its public API, but inside this decode loop it is pure bookkeeping.
-        # Keeping the mirror in Python avoids a device->host sync per step.
-        done_py: List[bool] = [False] * batch_size
 
         # Generate
         for step in range(max_length - 1):
@@ -937,7 +946,7 @@ def _generate_with_beam_search_impl(
             next_token_scores = F.log_softmax(next_token_logits.float(), dim=-1)
             
             # Add beam scores
-            next_token_scores = next_token_scores + beam_scores[:, None]
+            next_token_scores = next_token_scores + beam_scores.reshape(-1, 1)
             
             # Reshape for beam selection: (batch, num_beams * vocab_size)
             vocab_size = next_token_scores.shape[-1]
@@ -955,132 +964,123 @@ def _generate_with_beam_search_impl(
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode='floor')
             next_tokens = next_tokens % vocab_size
 
-            # Pack the two int64 candidate tensors into a single device->host
-            # copy. ``next_tokens`` and ``next_indices`` share dtype/shape, so
-            # one stacked transfer beats two back-to-back ``.cpu()`` calls
-            # (each of which forces its own sync). Scores stay separate
-            # because they're a different dtype (float).
-            cand_pack = torch.stack([next_tokens, next_indices], dim=0).cpu().tolist()
-            cand_tokens_cpu, cand_beams_cpu = cand_pack[0], cand_pack[1]
-            cand_scores_cpu = next_scores.cpu().tolist()
-
-            # ``done_py`` is maintained across the whole decode loop, so we
-            # no longer pull it off the scorer's device tensor here.
-
-            # Pre-allocate per-batch selection buffers sized for num_beams.
-            new_beam_idx_global = [0] * (batch_size * num_beams)
-            new_beam_next_tokens = [pad_token_id] * (batch_size * num_beams)
-            new_beam_scores = [float('-inf')] * (batch_size * num_beams)
-
-            done_this_step: List[int] = []
-
-            for batch_idx in range(batch_size):
-                first_beam_global = batch_idx * num_beams
-
-                if done_py[batch_idx]:
-                    # This batch is done, pad all num_beams to maintain shape.
-                    for i in range(num_beams):
-                        new_beam_idx_global[first_beam_global + i] = first_beam_global + i
-                        new_beam_next_tokens[first_beam_global + i] = pad_token_id
-                        new_beam_scores[first_beam_global + i] = float('-inf')
-                    continue
-
-                selected = 0
-                for cand_pos in range(2 * num_beams):
-                    if selected >= num_beams:
-                        break
-
-                    token_id = int(cand_tokens_cpu[batch_idx][cand_pos])
-                    score = float(cand_scores_cpu[batch_idx][cand_pos])
-                    beam_offset = int(cand_beams_cpu[batch_idx][cand_pos])
-                    source_global = first_beam_global + beam_offset
-
-                    if token_id == eos_token_id:
-                        # Finish this hypothesis but do not consume a live beam slot.
-                        prev_seq = input_ids[source_global]
-                        eos_tensor = torch.tensor(
-                            [eos_token_id], device=prev_seq.device, dtype=prev_seq.dtype
-                        )
-                        full_seq = torch.cat([prev_seq, eos_tensor])
-                        beam_scorer.finished_hypotheses[batch_idx].append(
-                            BeamHypothesis(tokens=full_seq.clone(), score=score)
-                        )
-                        continue
-
-                    slot = first_beam_global + selected
-                    new_beam_idx_global[slot] = source_global
-                    new_beam_next_tokens[slot] = token_id
-                    new_beam_scores[slot] = score
-                    selected += 1
-
-                # If we could not fill all beam slots (rare: all candidates were EOS),
-                # pad remaining slots with the first candidate's source beam so the
-                # tensor shape stays consistent. These slots are suppressed to -inf.
-                while selected < num_beams:
-                    slot = first_beam_global + selected
-                    fallback_beam = int(cand_beams_cpu[batch_idx][0])
-                    new_beam_idx_global[slot] = first_beam_global + fallback_beam
-                    new_beam_next_tokens[slot] = pad_token_id
-                    new_beam_scores[slot] = float('-inf')
-                    selected += 1
-
-                # Early-stopping bookkeeping: a batch is done when it has gathered
-                # num_beams finished hypotheses (mirrors BeamSearchScorer semantics).
-                if early_stopping:
-                    if len(beam_scorer.finished_hypotheses[batch_idx]) >= num_beams:
-                        done_this_step.append(batch_idx)
-                else:
-                    batch_scores = new_beam_scores[
-                        first_beam_global:first_beam_global + num_beams
-                    ]
-                    if all(score == float("-inf") for score in batch_scores):
-                        done_this_step.append(batch_idx)
-
-            for bi in done_this_step:
-                done_py[bi] = True
-
-            # Create new input_ids using the selected live beams.
-            beam_idx_tensor = torch.tensor(
-                new_beam_idx_global, device=device, dtype=torch.long
+            current_length = input_ids.shape[1]
+            current_sequences = input_ids.view(batch_size, num_beams, current_length)
+            candidate_sequences = current_sequences.gather(
+                1,
+                next_indices.unsqueeze(-1).expand(-1, -1, current_length),
             )
-            next_token_tensor = torch.tensor(
-                new_beam_next_tokens, device=device, dtype=torch.long
-            ).unsqueeze(1)
-            input_ids = torch.cat([input_ids[beam_idx_tensor], next_token_tensor], dim=1)
-
-            beam_scores = torch.tensor(
-                new_beam_scores, device=device, dtype=torch.float32
+            candidate_sequences = torch.cat(
+                [candidate_sequences, next_tokens.unsqueeze(-1)],
+                dim=-1,
             )
-            # ``encoder_output`` and ``src_attention_mask`` are already duplicated
-            # per-beam and are identical across beams within a batch (they only
-            # depend on the source sentence). Reordering by ``beam_idx_tensor``
-            # produces a tensor with the same values but forces a new allocation
-            # every step, so we skip it entirely. The same argument applies to
-            # the cross-attention KV cache (projected from encoder_output), so
-            # only the self-attention caches — which actually track per-beam
-            # history — are gathered. ``beam_idx_tensor`` always selects within
-            # each batch's own beam group, which keeps this valid.
+
+            eos_mask = next_tokens.eq(eos_token_id)
+            normalized_scores = next_scores / (
+                float(current_length + 1) ** float(length_penalty)
+            )
+            new_finished_scores = normalized_scores.masked_fill(
+                ~eos_mask, float("-inf")
+            )
+            candidate_finished = F.pad(
+                candidate_sequences,
+                (0, max_length - current_length - 1),
+                value=eos_token_id,
+            )
+            combined_finished_scores = torch.cat(
+                [finished_scores, new_finished_scores], dim=1
+            )
+            combined_finished_sequences = torch.cat(
+                [finished_sequences, candidate_finished], dim=1
+            )
+            finished_scores, finished_positions = torch.topk(
+                combined_finished_scores,
+                num_beams,
+                dim=1,
+                largest=True,
+                sorted=True,
+            )
+            finished_sequences = combined_finished_sequences.gather(
+                1,
+                finished_positions.unsqueeze(-1).expand(-1, -1, max_length),
+            )
+
+            # EOS candidates do not consume a live beam slot.
+            live_candidate_scores = next_scores.masked_fill(
+                eos_mask, float("-inf")
+            )
+            live_scores, live_positions = torch.topk(
+                live_candidate_scores,
+                num_beams,
+                dim=1,
+                largest=True,
+                sorted=True,
+            )
+            live_beams = next_indices.gather(1, live_positions)
+            live_tokens = next_tokens.gather(1, live_positions)
+
+            finished_count = torch.isfinite(finished_scores).sum(dim=1)
+            if early_stopping:
+                newly_done = finished_count.ge(num_beams)
+            else:
+                newly_done = ~torch.isfinite(live_scores).any(dim=1)
+            done = done | newly_done
+
+            identity_beams = torch.arange(num_beams, device=device).expand(
+                batch_size, -1
+            )
+            live_beams = torch.where(done[:, None], identity_beams, live_beams)
+            live_tokens = torch.where(
+                done[:, None],
+                torch.full_like(live_tokens, pad_token_id),
+                live_tokens,
+            )
+            live_scores = live_scores.masked_fill(done[:, None], float("-inf"))
+
+            batch_offsets = (
+                torch.arange(batch_size, device=device).unsqueeze(1) * num_beams
+            )
+            beam_idx_tensor = (batch_offsets + live_beams).reshape(-1)
+            input_ids = torch.cat(
+                [input_ids[beam_idx_tensor], live_tokens.reshape(-1, 1)],
+                dim=1,
+            )
+            beam_scores = live_scores
+            # Source activations and cross-attention K/V are shared by every
+            # beam in a source group, so only self-attention history is gathered.
             past_key_values = _reorder_past_key_values(
                 past_key_values, beam_idx_tensor, self_only=True
             )
 
-            # Early stopping driven entirely by the Python mirror — no
-            # device->host sync on ``beam_scorer.done`` here.
-            if all(done_py):
+            # Early stopping checks one device scalar.
+            # Candidate bookkeeping stays on-device; only this all-done scalar
+            # is observed by Python to terminate the autoregressive loop.
+            if bool(done.all()):
                 logger.debug("Beam search early stopping at step %d", step + 1)
                 break
 
-        # Flush the Python mirror back to the scorer's device tensor so any
-        # caller that later inspects ``beam_scorer.done`` sees consistent state.
-        if any(done_py):
-            beam_scorer.done = torch.tensor(done_py, dtype=torch.bool, device=device)
-
-        # Finalize and get best sequences
-        best_sequences = beam_scorer.finalize(
-            input_ids=input_ids,
-            final_scores=beam_scores,
-            max_length=max_length,
+        # Compare completed hypotheses with live beams that reached the limit.
+        final_length = input_ids.shape[1]
+        live_sequences = input_ids.view(batch_size, num_beams, final_length)
+        live_sequences = F.pad(
+            live_sequences,
+            (0, max_length - final_length),
+            value=eos_token_id,
         )
+        live_normalized_scores = beam_scores / (
+            float(final_length) ** float(length_penalty)
+        )
+        final_scores = torch.cat(
+            [finished_scores, live_normalized_scores], dim=1
+        )
+        final_sequences = torch.cat(
+            [finished_sequences, live_sequences], dim=1
+        )
+        best_positions = final_scores.argmax(dim=1)
+        best_sequences = final_sequences.gather(
+            1,
+            best_positions[:, None, None].expand(-1, 1, max_length),
+        ).squeeze(1)
     
     logger.debug("Beam search complete: final_length=%d", best_sequences.shape[1])
     return best_sequences

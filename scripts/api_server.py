@@ -25,7 +25,11 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 import os
 
-from lingolite.mobile_translation_model import create_model, MobileTranslationModel
+from lingolite.mobile_translation_model import (
+    create_model,
+    load_model_from_checkpoint,
+    MobileTranslationModel,
+)
 from lingolite.translation_tokenizer import TranslationTokenizer
 from lingolite.utils import setup_logger, get_device
 
@@ -191,13 +195,19 @@ async def startup_event() -> None:
             # SECURITY: Use weights_only=True to prevent arbitrary code execution
             checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=True)
             vocab_size = tokenizer.get_vocab_size()
-            model = create_model(vocab_size=vocab_size, model_size=configured_model_size)
-            state = checkpoint.get("model_state_dict", checkpoint)
-            model.load_state_dict(state)
+            model = load_model_from_checkpoint(
+                checkpoint,
+                fallback_vocab_size=vocab_size,
+                fallback_model_size=configured_model_size,
+            )
             model = model.to(device)
             model.eval()
             logger.info("Model loaded from checkpoint")
-            current_model_size = configured_model_size
+            current_model_size = (
+                "custom"
+                if isinstance(checkpoint, dict) and "config" in checkpoint
+                else configured_model_size
+            )
         else:
             if os.getenv("LINGOLITE_ALLOW_RANDOM_MODEL") == "1":
                 logger.warning("Using randomly initialized model (dev mode)")

@@ -10,14 +10,16 @@
 
 ## Development Status
 
-**LingoLite is ready for community experimentation but remains non-production.**
+**LingoLite is fit for purpose as an NMT engineering framework, but remains
+non-production until a trained checkpoint passes real-corpus quality and target
+hardware gates.**
 
 - `NO CHECKPOINTS`: ship your own tokenizer and model artifacts
-- `PIPELINE IN FLUX`: training loop validated only on tiny synthetic data
+- `ENGINEERING PIPELINE`: training, checkpoint, evaluation, quantization, and export paths are regression-tested
 - `BRING DATA`: repository does not include real datasets
+- `QUALITY GATE REQUIRED`: validate BLEU/chrF, robustness, and domain behavior before deployment
 - `API NEEDS ARTIFACTS`: server fails closed unless checkpoints/tokenizers are mounted
-- `COMMUNITY DRIVEN`: success depends on contributors sharing improvements
-- `RESEARCH FOCUS`: refer to `docs/reports/PRODUCTION_READINESS.md` for detailed limitations
+- `TARGET BENCHMARK REQUIRED`: measure latency and memory on the intended CPU/GPU/mobile runtime
 
 See [`docs/reports/OPEN_SOURCE_READINESS_REPORT.md`](docs/reports/OPEN_SOURCE_READINESS_REPORT.md) for the latest open-source verification summary.
 
@@ -389,60 +391,38 @@ python scripts/examples.py
 
 ## Model Quantization
 
-LingoLite includes comprehensive quantization utilities to reduce model size and improve inference speed.
+LingoLite supports post-training dynamic INT8 quantization. With `torchao`
+installed it uses the optimized backend; otherwise it uses a compatibility
+fallback that reduces checkpoint size but may be slower than FP32.
 
 ### Dynamic Quantization (Post-Training)
 
 ```python
-from lingolite.quantization_utils import quantize_model_dynamic
-
-# Quantize model to INT8
-quantized_model = quantize_model_dynamic(
-    model,
-    dtype=torch.qint8,
-    output_path="model_quantized.pt"
+from lingolite.quantization_utils import (
+    apply_dynamic_quantization,
+    measure_model_size,
+    save_quantized_checkpoint,
 )
 
-# Model size reduced by ~75% (FP32 → INT8)
-print(f"Size reduction: {model.num_parameters() * 4 / (1024**2):.1f}MB → "
-      f"{model.num_parameters() / (1024**2):.1f}MB")
+# Quantize model to INT8
+quantized_model = apply_dynamic_quantization(model, dtype=torch.qint8)
+save_quantized_checkpoint(quantized_model, "model_quantized.pt")
+
+print(measure_model_size(quantized_model))
 ```
 
 ### Static Quantization (Calibration-Based)
 
-```python
-from lingolite.quantization_utils import quantize_model_static
-
-# Prepare calibration dataset
-calibration_data = [...]  # Your representative samples
-
-# Static quantization for maximum efficiency
-quantized_model = quantize_model_static(
-    model,
-    calibration_data,
-    output_path="model_static_quantized.pt"
-)
-```
+Static quantization is not currently supported for this transformer layout.
+The helper fails explicitly rather than producing an unvalidated artifact.
 
 ### Quantization-Aware Training (QAT)
 
-```python
-from lingolite.quantization_utils import prepare_qat_model, convert_qat_model
-
-# Prepare model for QAT
-qat_model = prepare_qat_model(model)
-
-# Train with quantization simulation
-trainer.train(qat_model)
-
-# Convert to quantized model
-quantized_model = convert_qat_model(qat_model)
-```
+Quantization-aware training is not currently supported.
 
 Quantization features:
-- **Dynamic Quantization**: Fast post-training quantization
-- **Static Quantization**: Calibration-based for optimal accuracy
-- **Quantization-Aware Training**: Train with quantization in the loop
+- **Dynamic INT8**: `torchao` when installed, compatibility fallback otherwise
+- **Portable checkpoints**: architecture and quantization backend metadata included
 - **Compression Analysis**: Detailed size and performance metrics
 
 ## ONNX Export for Mobile Deployment
@@ -564,13 +544,15 @@ new languages, prefer resources that include explicit language codes or metadata
 clean filtering.
 
 ```python
-from lingolite.training import TranslationDataset
+import functools
+
+from lingolite.training import TranslationDataset, collate_fn
 from torch.utils.data import DataLoader
 
 # Your parallel corpus
 data = [
-    {"src": "Hello", "tgt": "Hola", "src_lang": "en", "tgt_lang": "es"},
-    {"src": "Goodbye", "tgt": "Adiós", "src_lang": "en", "tgt_lang": "es"},
+    {"src_text": "Hello", "tgt_text": "Hola", "src_lang": "en", "tgt_lang": "es"},
+    {"src_text": "Goodbye", "tgt_text": "Adiós", "src_lang": "en", "tgt_lang": "es"},
     # ... more examples
 ]
 
@@ -578,7 +560,8 @@ data = [
 dataset = TranslationDataset(
     data=data,
     tokenizer=tokenizer,
-    max_length=128
+    max_length=128,
+    pretokenize=True,  # encode once instead of once per epoch
 )
 
 # Create dataloader
@@ -586,7 +569,7 @@ dataloader = DataLoader(
     dataset,
     batch_size=32,
     shuffle=True,
-    collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_token_id)
+    collate_fn=functools.partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
 )
 ```
 
@@ -598,17 +581,18 @@ from lingolite.training import TranslationTrainer
 # Initialize trainer
 trainer = TranslationTrainer(
     model=model,
-    train_dataloader=dataloader,
+    train_loader=dataloader,
     learning_rate=1e-4,
-    num_epochs=10,
-    device="cuda" if torch.cuda.is_available() else "cpu"
+    max_steps=100_000,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    loss_chunk_size=1024,
 )
 
 # Train
-trainer.train()
+trainer.train(num_epochs=10)
 
-# Save model
-torch.save(model.state_dict(), "translation_model.pt")
+# Save a portable checkpoint with exact model configuration
+trainer.save_checkpoint("translation_model.pt")
 ```
 
 ### Exhaustive Training Strategy
@@ -731,12 +715,12 @@ output = model.generate(
 )
 ```
 
-### Beam Search (Higher Quality)
+### Beam Search (Validation-Tuned)
 ```python
 output = model.generate_beam(
     src_input_ids=input_ids,
     max_length=128,
-    num_beams=4,           # More beams = better quality but slower
+    num_beams=4,           # Tune against greedy decoding on held-out data
     length_penalty=1.0,     # >1.0 favors longer, <1.0 favors shorter
     early_stopping=True,    # Stop when all beams finish
     sos_token_id=1,
