@@ -14,8 +14,16 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 try:
     import sacrebleu
 except ImportError:
-    print("ERROR: sacrebleu not installed. Install with: pip install sacrebleu")
-    exit(1)
+    # Do NOT exit at import time: that kills any process that merely imports
+    # this module (e.g. pytest collection). Fail at use-time instead.
+    sacrebleu = None  # type: ignore[assignment]
+
+
+def _require_sacrebleu() -> None:
+    if sacrebleu is None:
+        raise ImportError(
+            "sacrebleu not installed. Install with: pip install sacrebleu"
+        )
 
 from lingolite.mobile_translation_model import MobileTranslationModel, create_model
 from lingolite.translation_tokenizer import TranslationTokenizer
@@ -149,6 +157,7 @@ def compute_bleu_metrics(
     Returns:
         Dictionary with BLEU scores and metrics
     """
+    _require_sacrebleu()
     # sacrebleu expects references as list of lists (one list per reference set)
     # If we have single references per hypothesis, wrap each in a list
     if isinstance(references[0], str):
@@ -217,6 +226,7 @@ def compute_chrf(
         references = [[sent[i] for sent in references] for i in range(num_refs)]
     # else: already in per-reference-set format, no transpose needed
 
+    _require_sacrebleu()
     chrf = sacrebleu.corpus_chrf(hypotheses, references)
     return chrf.score
 

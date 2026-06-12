@@ -9,8 +9,8 @@
   "d_ff": 128,
   "max_seq_len": 32,
   "pad_token_id": 0,
-  "first_loss": 3.7457275390625,
-  "final_loss": 0.12040556967258453,
-  "steps": 104,
+  "first_loss": 3.752601146697998,
+  "final_loss": 0.10147599875926971,
+  "steps": 108,
   "data_path": "examples\\data\\tiny_smoke_dataset.json"
 }

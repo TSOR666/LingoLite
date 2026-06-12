@@ -214,8 +214,20 @@ class KVCache:
         """Reorder cached batch entries after beam selection."""
         if self._key_buf is None or self._value_buf is None:
             return self
-        self._key_buf = self._key_buf.index_select(0, beam_indices.to(device=self._key_buf.device))
-        self._value_buf = self._value_buf.index_select(0, beam_indices.to(device=self._value_buf.device))
+        idx = beam_indices.to(device=self._key_buf.device)
+        if self._capacity is not None:
+            # Reserved mode: gather only the valid prefix and write it back
+            # in-place. index_select on the full buffer would copy all
+            # ``capacity`` positions every step (O(max_len) per step, i.e.
+            # O(max_len^2) over a decode) and reallocate the buffer.
+            if self._length > 0:
+                k_prefix = self._key_buf[:, :, : self._length, :].index_select(0, idx)
+                v_prefix = self._value_buf[:, :, : self._length, :].index_select(0, idx)
+                self._key_buf[:, :, : self._length, :] = k_prefix
+                self._value_buf[:, :, : self._length, :] = v_prefix
+            return self
+        self._key_buf = self._key_buf.index_select(0, idx)
+        self._value_buf = self._value_buf.index_select(0, idx)
         return self
 
     def get_seq_len(self) -> int:
@@ -235,20 +247,35 @@ class LayerKVCache:
         self.cross_attn_cache.to(device, dtype=dtype)
         return self
 
-    def reorder(self, beam_indices: torch.Tensor) -> 'LayerKVCache':
+    def reorder(self, beam_indices: torch.Tensor, self_only: bool = False) -> 'LayerKVCache':
+        """Reorder cached batch entries after beam selection.
+
+        Args:
+            beam_indices: New ordering of the batch dimension.
+            self_only: Skip the cross-attention cache. Valid whenever the
+                reordering only permutes beams *within* a batch group: the
+                cross-attention K/V depend only on the (per-batch) source
+                sentence, so they are identical across the beams of a group
+                and the gather would be a no-op copy.
+        """
         self.self_attn_cache.reorder(beam_indices)
-        self.cross_attn_cache.reorder(beam_indices)
+        if not self_only:
+            self.cross_attn_cache.reorder(beam_indices)
         return self
 
 
 def _reorder_past_key_values(
     past_key_values: Optional[List[LayerKVCache]],
     beam_indices: torch.Tensor,
+    self_only: bool = False,
 ) -> Optional[List[LayerKVCache]]:
     """Reorder decoder caches to match the new beam ordering."""
     if past_key_values is None:
         return None
-    return [layer_cache.reorder(beam_indices) for layer_cache in past_key_values]
+    return [
+        layer_cache.reorder(beam_indices, self_only=self_only)
+        for layer_cache in past_key_values
+    ]
 
 
 def _build_preallocated_caches(
@@ -573,6 +600,11 @@ def generate_with_kv_cache(
         Generated sequences (batch, gen_len)
     """
     InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
+    # Switch to eval for decoding but restore the caller's mode afterwards:
+    # silently leaving the model in eval() after an in-training generation
+    # (e.g. sampling translations during validation) would disable dropout for
+    # the rest of the training run.
+    was_training = model.training
     model.eval()
     device = src_input_ids.device
     batch_size = src_input_ids.shape[0]
@@ -585,10 +617,46 @@ def generate_with_kv_cache(
     InputValidator.validate_positive_float(temperature, "temperature", min_value=1e-8)
     temperature = max(0.01, float(temperature))
 
-    logger.info(
+    logger.debug(
         "Generating with KV cache: batch_size=%d, max_length=%d", batch_size, max_length
     )
 
+    try:
+        return _generate_with_kv_cache_impl(
+            model=model,
+            src_input_ids=src_input_ids,
+            src_attention_mask=src_attention_mask,
+            max_length=max_length,
+            sos_token_id=sos_token_id,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            pad_token_id=pad_token_id,
+            do_sample=do_sample,
+            device=device,
+            batch_size=batch_size,
+        )
+    finally:
+        if was_training:
+            model.train()
+
+
+def _generate_with_kv_cache_impl(
+    model: "MobileTranslationModel",
+    src_input_ids: torch.Tensor,
+    src_attention_mask: Optional[torch.Tensor],
+    max_length: int,
+    sos_token_id: int,
+    eos_token_id: int,
+    temperature: float,
+    top_k: Optional[int],
+    top_p: float,
+    pad_token_id: int,
+    do_sample: bool,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
     with torch.inference_mode():
         encoder_output = model.encoder(
             input_ids=src_input_ids,
@@ -693,13 +761,13 @@ def generate_with_kv_cache(
             finished = finished | (next_token.squeeze(1) == eos_token_id)
 
             if finished.all():
-                logger.info("Early stopping at step %d", step + 1)
+                logger.debug("Early stopping at step %d", step + 1)
                 break
 
     # Slice down to the actual filled prefix so callers see the same shape
     # they would have seen with the old ``cat``-based implementation.
     generated = generated[:, :generated_len]
-    logger.info("Generation complete: final_length=%d", generated.shape[1])
+    logger.debug("Generation complete: final_length=%d", generated.shape[1])
     return generated
 
 
@@ -743,12 +811,51 @@ def generate_with_beam_search(
     """
     InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
     InputValidator.validate_positive_int(num_beams, "num_beams", min_value=1)
+    # Switch to eval for decoding but restore the caller's mode afterwards
+    # (see generate_with_kv_cache).
+    was_training = model.training
     model.eval()
     device = src_input_ids.device
     batch_size = src_input_ids.shape[0]
-    
-    logger.info(f"Generating with beam search: batch_size={batch_size}, num_beams={num_beams}")
-    
+
+    logger.debug(
+        "Generating with beam search: batch_size=%d, num_beams=%d", batch_size, num_beams
+    )
+
+    try:
+        return _generate_with_beam_search_impl(
+            model=model,
+            src_input_ids=src_input_ids,
+            src_attention_mask=src_attention_mask,
+            max_length=max_length,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            early_stopping=early_stopping,
+            sos_token_id=sos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            device=device,
+            batch_size=batch_size,
+        )
+    finally:
+        if was_training:
+            model.train()
+
+
+def _generate_with_beam_search_impl(
+    model: "MobileTranslationModel",
+    src_input_ids: torch.Tensor,
+    src_attention_mask: Optional[torch.Tensor],
+    max_length: int,
+    num_beams: int,
+    length_penalty: float,
+    early_stopping: bool,
+    sos_token_id: int,
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
     with torch.inference_mode():
         # Encode source
         encoder_output = model.encoder(
@@ -948,14 +1055,19 @@ def generate_with_beam_search(
             # per-beam and are identical across beams within a batch (they only
             # depend on the source sentence). Reordering by ``beam_idx_tensor``
             # produces a tensor with the same values but forces a new allocation
-            # every step, so we skip it entirely and only reorder the decoder
-            # KV caches, which actually track per-beam history.
-            past_key_values = _reorder_past_key_values(past_key_values, beam_idx_tensor)
+            # every step, so we skip it entirely. The same argument applies to
+            # the cross-attention KV cache (projected from encoder_output), so
+            # only the self-attention caches — which actually track per-beam
+            # history — are gathered. ``beam_idx_tensor`` always selects within
+            # each batch's own beam group, which keeps this valid.
+            past_key_values = _reorder_past_key_values(
+                past_key_values, beam_idx_tensor, self_only=True
+            )
 
             # Early stopping driven entirely by the Python mirror — no
             # device->host sync on ``beam_scorer.done`` here.
             if all(done_py):
-                logger.info(f"Beam search early stopping at step {step + 1}")
+                logger.debug("Beam search early stopping at step %d", step + 1)
                 break
 
         # Flush the Python mirror back to the scorer's device tensor so any
@@ -970,7 +1082,7 @@ def generate_with_beam_search(
             max_length=max_length,
         )
     
-    logger.info(f"Beam search complete: final_length={best_sequences.shape[1]}")
+    logger.debug("Beam search complete: final_length=%d", best_sequences.shape[1])
     return best_sequences
 
 

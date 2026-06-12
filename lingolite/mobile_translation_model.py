@@ -246,7 +246,11 @@ class MobileTranslationModel(nn.Module):
                 eos_token_id=eos_token_id,
             )
 
-        logger.info(f"Generating translation: src_len={src_input_ids.shape[1]}, max_length={max_length}")
+        logger.debug(
+            "Generating translation: src_len=%d, max_length=%d",
+            src_input_ids.shape[1],
+            max_length,
+        )
 
         # FIXED: Validate and clamp temperature before generation loop
         temperature = max(0.01, float(temperature))

@@ -16,6 +16,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
+import anyio
+import threading
 import torch
 import time
 import logging
@@ -94,6 +96,9 @@ app.add_middleware(
 
 model: Optional[MobileTranslationModel] = None
 tokenizer: Optional[TranslationTokenizer] = None
+# Serializes generate calls across worker threads (the model mutates
+# train/eval mode and per-decode KV caches, so it is not re-entrant).
+_inference_lock = threading.Lock()
 device: torch.device = torch.device("cpu")
 device_preference: str = "auto"
 configured_model_size: str = "small"
@@ -284,31 +289,39 @@ async def translate(request: TranslationRequest) -> TranslationResponse:
     )
     input_tensor = torch.tensor([input_ids], device=device)
 
-    with torch.inference_mode():
-        if request.method == "beam" and hasattr(model, "generate_beam"):
-            output_ids = model.generate_beam(
-                src_input_ids=input_tensor,
-                max_length=request.max_length,
-                num_beams=request.num_beams,
-                sos_token_id=tokenizer.sos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        elif request.method == "fast" and hasattr(model, "generate_fast"):
-            output_ids = model.generate_fast(
+    def _run_generation() -> torch.Tensor:
+        # The model is not safe for concurrent generate calls (train/eval mode
+        # flips, KV-cache state), so serialize them behind a lock while keeping
+        # the event loop free to answer health checks and queue requests.
+        with _inference_lock, torch.inference_mode():
+            if request.method == "beam" and hasattr(model, "generate_beam"):
+                return model.generate_beam(
+                    src_input_ids=input_tensor,
+                    max_length=request.max_length,
+                    num_beams=request.num_beams,
+                    sos_token_id=tokenizer.sos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            if request.method == "fast" and hasattr(model, "generate_fast"):
+                return model.generate_fast(
+                    src_input_ids=input_tensor,
+                    max_length=request.max_length,
+                    sos_token_id=tokenizer.sos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    temperature=request.temperature,
+                )
+            return model.generate(
                 src_input_ids=input_tensor,
                 max_length=request.max_length,
                 sos_token_id=tokenizer.sos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 temperature=request.temperature,
             )
-        else:
-            output_ids = model.generate(
-                src_input_ids=input_tensor,
-                max_length=request.max_length,
-                sos_token_id=tokenizer.sos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                temperature=request.temperature,
-            )
+
+    # Run the (CPU/GPU-bound, possibly multi-second) generation in a worker
+    # thread: a synchronous call here would block the entire asyncio event
+    # loop, freezing /health and every other request for the duration.
+    output_ids = await anyio.to_thread.run_sync(_run_generation)
 
     translation = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
     inference_time = (time.time() - start_time) * 1000.0
