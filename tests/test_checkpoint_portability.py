@@ -115,6 +115,24 @@ def test_training_cli_exposes_memory_controls() -> None:
     assert args.gradient_checkpointing is True
 
 
+def test_training_cli_exposes_resume_checkpoint() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--train-data",
+            "train.json",
+            "--tokenizer-path",
+            "tokenizer",
+            "--save-dir",
+            "checkpoints",
+            "--resume-from",
+            "checkpoint_step_160000.pt",
+        ]
+    )
+
+    assert args.resume_from == "checkpoint_step_160000.pt"
+
+
 def test_decode_benchmark_reports_throughput() -> None:
     result = _bench_decode(
         name="greedy",

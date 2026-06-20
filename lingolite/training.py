@@ -683,8 +683,7 @@ class TranslationTrainer:
 
     def load_checkpoint(self, filename: str) -> None:
         """Load model checkpoint."""
-        checkpoint_path = Path(filename)
-        load_path = checkpoint_path if checkpoint_path.is_absolute() else self.save_dir / checkpoint_path
+        load_path = Path(filename)
         # SECURITY: Use weights_only=True to prevent arbitrary code execution
         checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
 
@@ -888,6 +887,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='Device to train on')
     parser.add_argument('--save-dir', type=str, default='./checkpoints',
                         help='Directory to save checkpoints')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Resume training from a checkpoint path.')
 
     # Reproducibility
     parser.add_argument('--seed', type=int, default=42,
@@ -1066,6 +1067,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         loss_chunk_size=args.loss_chunk_size,
     )
     print("[OK] Trainer ready")
+
+    if args.resume_from:
+        print(f"\nResuming from checkpoint: {args.resume_from}")
+        trainer.load_checkpoint(args.resume_from)
+        if trainer.global_step >= args.max_steps:
+            print(
+                f"[WARN] Resumed global_step ({trainer.global_step}) is already "
+                f">= max_steps ({args.max_steps}); increase --max-steps to continue training."
+            )
 
     # Start training
     print("\n" + "=" * 80)
