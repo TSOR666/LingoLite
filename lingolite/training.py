@@ -4,12 +4,13 @@ Complete pipeline from data to trained model
 """
 
 import argparse
+from collections import Counter
 import functools
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Dict, Iterator, List, Optional, Tuple, cast
 
 import math
 
@@ -17,7 +18,7 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR, OneCycleLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm  # type: ignore[import-untyped]
 
 from .mobile_translation_model import MobileTranslationModel, create_model
@@ -53,6 +54,7 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self._encoded_data: Optional[List[Dict[str, List[int]]]] = None
+        self._sequence_lengths: Optional[List[Tuple[int, int]]] = None
         if pretokenize:
             self._encoded_data = [self._encode_item(i) for i in range(len(self.data))]
         
@@ -63,6 +65,24 @@ class TranslationDataset(Dataset[Dict[str, List[int]]]):
         if self._encoded_data is not None:
             return {key: list(value) for key, value in self._encoded_data[idx].items()}
         return self._encode_item(idx)
+
+    def sequence_lengths(self) -> List[Tuple[int, int]]:
+        """Return cached (source, target) token lengths for batch planning.
+
+        Without pretokenization, only lengths are retained after this one-time
+        encoding pass. Pretokenized datasets reuse their existing token IDs.
+        Treat dataset contents and tokenizer configuration as immutable.
+        """
+        if self._sequence_lengths is None:
+            lengths = []
+            for index in range(len(self)):
+                item = (self._encoded_data[index] if self._encoded_data is not None
+                        else self._encode_item(index))
+                lengths.append(
+                    (len(item['src_input_ids']), len(item['tgt_input_ids']))
+                )
+            self._sequence_lengths = lengths
+        return list(self._sequence_lengths)
 
     def _encode_item(self, idx: int) -> Dict[str, List[int]]:
         item = self.data[idx]
@@ -201,6 +221,119 @@ def collate_fn(batch: List[Dict[str, List[int]]], pad_token_id: int = 0) -> Dict
         'src_attention_mask': torch.tensor(src_mask, dtype=torch.float),
         'tgt_attention_mask': torch.tensor(tgt_mask, dtype=torch.float),
     }
+
+
+class TranslationBatchSampler(Sampler[List[int]]):
+    """Plan shuffled, length-bucketed batches with an optional token budget.
+
+    ``max_tokens`` bounds ``batch_size * (max_src_length + max_tgt_length)``
+    after padding. It is a token budget, not a hard accelerator-memory limit:
+    attention also depends on sequence length and the model architecture.
+
+    By default each example appears exactly once per epoch. Opting into
+    ``language_temperature`` samples ``len(dataset)`` examples with replacement,
+    assigning each directed language pair probability proportional to
+    ``pair_count ** (1 / temperature)``. Values above one give smaller corpora
+    more exposure; one preserves corpus proportions in expectation.
+    """
+
+    def __init__(
+        self,
+        dataset: TranslationDataset,
+        batch_size: int = 32,
+        max_tokens: Optional[int] = None,
+        language_temperature: Optional[float] = None,
+        seed: int = 42,
+        bucket_size: Optional[int] = None,
+    ) -> None:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        if max_tokens is not None and (
+            isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1
+        ):
+            raise ValueError("max_tokens must be a positive integer")
+        if language_temperature is not None and (
+            not math.isfinite(language_temperature) or language_temperature <= 0
+        ):
+            raise ValueError("language_temperature must be finite and positive")
+        if bucket_size is None:
+            bucket_size = batch_size * 50
+        if isinstance(bucket_size, bool) or not isinstance(bucket_size, int) or bucket_size < 1:
+            raise ValueError("bucket_size must be a positive integer")
+
+        self.batch_size = batch_size
+        self.max_tokens = max_tokens
+        self.bucket_size = bucket_size
+        self.seed = seed
+        self.epoch = 0
+        self.lengths = dataset.sequence_lengths()
+        self._batches: Optional[List[List[int]]] = None
+        self._weights: Optional[torch.Tensor] = None
+        for index, (src_length, tgt_length) in enumerate(self.lengths):
+            if max_tokens is not None and src_length + tgt_length > max_tokens:
+                raise ValueError(
+                    f"Example {index} needs {src_length + tgt_length} tokens, "
+                    f"exceeding max_tokens={max_tokens}; increase the budget "
+                    "or lower the dataset max_length"
+                )
+
+        if language_temperature is not None and self.lengths:
+            pairs = [(item['src_lang'], item['tgt_lang']) for item in dataset.data]
+            counts = Counter(pairs)
+            # Each example receives its pair's probability divided by the
+            # pair size. Log-space normalization avoids count exponent overflow.
+            log_counts = torch.tensor([math.log(counts[pair]) for pair in pairs], dtype=torch.float64)
+            log_weights = (log_counts - log_counts.max()) / language_temperature - log_counts
+            self._weights = (log_weights - log_weights.max()).exp()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Select deterministic shuffle/sampling order for an epoch."""
+        if epoch != self.epoch:
+            self.epoch = epoch
+            self._batches = None
+
+    def _plan_batches(self) -> List[List[int]]:
+        if self._batches is not None:
+            return self._batches
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        size = len(self.lengths)
+        if self._weights is None:
+            indices = torch.randperm(size, generator=generator).tolist()
+        else:
+            indices = torch.multinomial(self._weights, size, replacement=True, generator=generator).tolist()
+
+        batches: List[List[int]] = []
+        # Sort within shuffled pools rather than the entire corpus, so similar
+        # lengths share padding while batches still vary between epochs.
+        for start in range(0, size, self.bucket_size):
+            pool = indices[start:start + self.bucket_size]
+            pool.sort(key=lambda index: (max(self.lengths[index]), self.lengths[index]))
+            batch: List[int] = []
+            max_src = max_tgt = 0
+            for index in pool:
+                src_length, tgt_length = self.lengths[index]
+                next_src, next_tgt = max(max_src, src_length), max(max_tgt, tgt_length)
+                padded_tokens = (len(batch) + 1) * (next_src + next_tgt)
+                if batch and (len(batch) >= self.batch_size or (
+                    self.max_tokens is not None and padded_tokens > self.max_tokens
+                )):
+                    batches.append(batch)
+                    batch = []
+                    max_src = max_tgt = 0
+                batch.append(index)
+                max_src, max_tgt = max(max_src, src_length), max(max_tgt, tgt_length)
+            if batch:
+                batches.append(batch)
+        order = torch.randperm(len(batches), generator=generator).tolist()
+        self._batches = [batches[index] for index in order]
+        return self._batches
+
+    def __iter__(self) -> Iterator[List[int]]:
+        # Do not expose the cached plan to mutation by a DataLoader consumer.
+        return (list(batch) for batch in self._plan_batches())
+
+    def __len__(self) -> int:
+        return len(self._plan_batches())
 
 
 class TranslationTrainer:
@@ -737,6 +870,10 @@ class TranslationTrainer:
             if training_complete:
                 break
 
+            batch_sampler = getattr(self.train_loader, 'batch_sampler', None)
+            if isinstance(batch_sampler, TranslationBatchSampler):
+                batch_sampler.set_epoch(epoch)
+
             print(f"\n{'='*80}")
             print(f"Epoch {epoch + 1}/{num_epochs}")
             print(f"{'='*80}")
@@ -845,7 +982,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Training arguments
     parser.add_argument('--batch-size', type=int, default=32,
-                        help='Training batch size')
+                        help='Training batch size (maximum examples with --max-tokens)')
+    parser.add_argument('--max-tokens', type=int, default=None,
+                        help='Enable length bucketing and cap padded source + target tokens per training batch')
+    parser.add_argument('--language-temperature', type=float, default=None,
+                        help='Sample language pairs proportional to count**(1/T); T>1 upsamples smaller corpora')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='DataLoader worker processes for train/validation loading')
     parser.add_argument('--pin-memory', action='store_true',
@@ -1015,12 +1156,25 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_length=args.max_length,
         pretokenize=args.pretokenize,
     )
+    train_batch_kwargs = {'batch_size': args.batch_size, 'shuffle': True}
+    if args.max_tokens is not None or args.language_temperature is not None:
+        try:
+            train_batch_kwargs = {
+                'batch_sampler': TranslationBatchSampler(
+                    train_dataset,
+                    batch_size=args.batch_size,
+                    max_tokens=args.max_tokens,
+                    language_temperature=args.language_temperature,
+                    seed=args.seed,
+                )
+            }
+        except ValueError as exc:
+            parser.error(str(exc))
     train_loader = cast(
         DataLoader[Dict[str, torch.Tensor]],
         DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
+            **train_batch_kwargs,
             collate_fn=functools.partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
             **dataloader_kwargs,
         ),

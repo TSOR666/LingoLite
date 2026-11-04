@@ -24,16 +24,15 @@ RUN mkdir -p /app/models /app/data /app/checkpoints /app/tokenizer
 ENV PYTHONUNBUFFERED=1
 ENV LINGOLITE_MODEL_SIZE=small
 ENV LINGOLITE_DEVICE=cpu
+ENV LINGOLITE_BIND_HOST=0.0.0.0
 ENV LINGOLITE_ALLOWED_ORIGINS="http://localhost,http://127.0.0.1"
 
-# Health check - verify API server is healthy (if running)
-# Falls back to checking torch import if API server is not running
+# Route traffic only after the model, tokenizer and batching worker are ready.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || \
-        python -c "import torch; import sys; sys.exit(0)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/readiness', timeout=5).read()" || exit 1
 
-# Expose port for API server (when implemented)
+# Expose the translation API.
 EXPOSE 8000
 
-# Default command - run lightweight validation (no PyTorch needed)
-CMD ["python", "scripts/install.py"]
+# Requires a matching trained checkpoint and tokenizer mounted into /app.
+CMD ["python", "-m", "scripts.api_server"]

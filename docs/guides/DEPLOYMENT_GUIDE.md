@@ -2,6 +2,11 @@
 
 This guide provides step-by-step instructions for deploying LingoLite in various environments.
 
+See the [architecture and scaling guide](ARCHITECTURE.md) for bounded batching,
+resource limits, batch translation, decoding controls, and replica deployment.
+The container now starts the API and checks readiness; mount matching trained
+model and tokenizer artifacts before running it.
+
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
