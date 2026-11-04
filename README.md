@@ -160,6 +160,12 @@ LingoLite uses a **Transformer encoder-decoder** architecture with modern optimi
 
 ### Key Components
 
+Translation orchestration now lives in a reusable `TranslationEngine`, with a
+bounded `TranslationService` for server microbatching. Decoding supports optional
+minimum length and repetition controls, and training supports token budgets and
+language-pair balancing. See the [architecture and scaling guide](docs/guides/ARCHITECTURE.md)
+for component boundaries, configuration, trade-offs and validation requirements.
+
 - **RMSNorm**: Efficient normalization layer (lighter than LayerNorm)
 - **Rotary Position Embeddings (RoPE)**: Relative position encoding without learned parameters
 - **Grouped Query Attention (GQA)**: Reduces KV cache size while maintaining quality
@@ -280,7 +286,9 @@ print(f"Beam search translation: {translation}")
 
 ## REST API Server
 
-LingoLite includes a production-ready FastAPI server for serving translations via HTTP endpoints.
+LingoLite includes a FastAPI server with bounded request batching for serving
+translations via HTTP. Production quality still requires validated artifacts
+and target-hardware benchmarks.
 
 ### Starting the Server
 
@@ -331,6 +339,14 @@ curl -X POST http://localhost:8000/translate \
 
 ### API Documentation
 
+`POST /translate/batch` accepts `texts` (up to 64 strings) in place of `text`,
+with the same language and generation options. It returns an ordered
+`translations` list. Both endpoints support `min_new_tokens`,
+`no_repeat_ngram_size`, and beam `length_penalty`. Inputs exceeding the model's
+source-token limit return an error instead of being silently truncated.
+Queue saturation returns 429 with `Retry-After`; deadlines return 504.
+See [serving configuration](docs/guides/ARCHITECTURE.md#bounded-serving-and-replication).
+
 Interactive API documentation is available at:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
@@ -348,7 +364,7 @@ LingoLite supports containerized deployment with Docker and Docker Compose.
 docker build -t lingolite:latest .
 
 # Run the container
-docker run -p 8000:8000 lingolite:latest
+docker run -p 8000:8000 -v "$(pwd)/models:/app/models:ro" -v "$(pwd)/tokenizer:/app/tokenizer:ro" lingolite:latest
 ```
 
 ### Docker Compose
@@ -619,6 +635,11 @@ trainer.save_checkpoint("translation_model.pt")
    minimize accuracy loss when compressing the model.
 
 ### Training Features
+
+Add `--max-tokens 4096 --language-temperature 2 --pretokenize` to the training
+CLI to group similar lengths and give smaller language-pair corpora more exposure.
+`--batch-size` remains the maximum number of examples per batch. These options
+are opt-in; see [training limits and semantics](docs/guides/ARCHITECTURE.md#training-at-larger-corpus-sizes).
 
 - **Mixed Precision Training**: Automatic with `torch.cuda.amp` (GPU only)
 - **Gradient Accumulation**: For effective larger batch sizes

@@ -3,7 +3,7 @@ Complete Mobile Translation Model
 Encoder-Decoder transformer optimized for mobile deployment
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, TypedDict, Set, SupportsFloat, SupportsInt, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, TypedDict, Set, SupportsFloat, SupportsInt, cast
 
 import torch
 import torch.nn as nn
@@ -212,6 +212,9 @@ class MobileTranslationModel(nn.Module):
         top_p: float = 1.0,
         num_beams: int = 1,
         do_sample: bool = False,
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
+        suppress_tokens: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """
         Generate translation (inference).
@@ -227,6 +230,9 @@ class MobileTranslationModel(nn.Module):
             top_p: Nucleus (top-p) sampling
             num_beams: Number of beams for beam search (1 = greedy)
             do_sample: Whether to sample stochastically (False = greedy/argmax)
+            min_new_tokens: Minimum tokens after SOS before EOS is permitted
+            no_repeat_ngram_size: Block repeated n-grams (0 disables)
+            suppress_tokens: Token IDs that must never be generated
         
         Returns:
             generated_ids: Generated token IDs (batch, gen_len)
@@ -257,6 +263,9 @@ class MobileTranslationModel(nn.Module):
                 num_beams=num_beams,
                 sos_token_id=sos_token_id,
                 eos_token_id=eos_token_id,
+                min_new_tokens=min_new_tokens,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                suppress_tokens=suppress_tokens,
             )
 
         logger.debug(
@@ -284,6 +293,9 @@ class MobileTranslationModel(nn.Module):
             top_k=top_k if top_k > 0 else None,
             top_p=top_p,
             do_sample=do_sample,
+            min_new_tokens=min_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            suppress_tokens=suppress_tokens,
         )
     
     def compute_loss(
@@ -393,6 +405,9 @@ class MobileTranslationModel(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
+        suppress_tokens: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """
         Fast generation with KV caching.
@@ -406,6 +421,9 @@ class MobileTranslationModel(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            min_new_tokens=min_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            suppress_tokens=suppress_tokens,
         )
     
     def generate_with_cache(
@@ -418,6 +436,9 @@ class MobileTranslationModel(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
+        suppress_tokens: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """
         Generate with KV caching for efficiency.
@@ -433,6 +454,9 @@ class MobileTranslationModel(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=1.0 if top_p is None else float(top_p),
+            min_new_tokens=min_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            suppress_tokens=suppress_tokens,
         )
 
     def generate_beam(
@@ -445,6 +469,9 @@ class MobileTranslationModel(nn.Module):
         early_stopping: bool = True,
         sos_token_id: int = 1,
         eos_token_id: int = 2,
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
+        suppress_tokens: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """
         Generate with beam search.
@@ -461,6 +488,9 @@ class MobileTranslationModel(nn.Module):
             early_stopping: Stop when num_beams hypotheses complete
             sos_token_id: Start-of-sequence token ID
             eos_token_id: End-of-sequence token ID
+            min_new_tokens: Minimum tokens after SOS before EOS is permitted
+            no_repeat_ngram_size: Block repeated n-grams (0 disables)
+            suppress_tokens: Token IDs that must never be generated
 
         Returns:
             Best sequences (batch, max_length)
@@ -476,6 +506,9 @@ class MobileTranslationModel(nn.Module):
             sos_token_id=sos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=self.pad_token_id,
+            min_new_tokens=min_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            suppress_tokens=suppress_tokens,
         )
 
 

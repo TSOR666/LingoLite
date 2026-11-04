@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -22,9 +22,80 @@ __all__ = [
     "LayerKVCache",
     "BeamHypothesis",
     "BeamSearchScorer",
+    "GenerationConstraints",
     "generate_with_kv_cache",
     "generate_with_beam_search",
 ]
+
+
+@dataclass(frozen=True)
+class GenerationConstraints:
+    """Shared, opt-in decoding controls for greedy, sampling, and beam search.
+
+    Length and n-gram history exclude the initial SOS. Repetition blocking is
+    a heuristic and should be tuned on held-out translations: legitimate
+    repeated words can otherwise be blocked. No model weights are changed.
+    """
+
+    min_new_tokens: int = 0
+    no_repeat_ngram_size: int = 0
+    suppress_tokens: Tuple[int, ...] = ()
+
+    def validate(self, max_length: int, vocab_size: Optional[int] = None) -> None:
+        for name in ("min_new_tokens", "no_repeat_ngram_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.min_new_tokens >= max_length:
+            raise ValueError("min_new_tokens must be less than max_length (which includes SOS)")
+        for token in self.suppress_tokens:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError("suppress_tokens must contain non-negative integer token IDs")
+            if vocab_size is not None and token >= vocab_size:
+                raise ValueError("suppress_tokens contains a token outside the vocabulary")
+        if vocab_size is not None and len(set(self.suppress_tokens)) >= vocab_size:
+            raise ValueError("suppress_tokens cannot suppress the entire vocabulary")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.min_new_tokens or self.no_repeat_ngram_size or self.suppress_tokens)
+
+    def apply(
+        self,
+        scores: torch.Tensor,
+        input_ids: torch.Tensor,
+        eos_token_id: int,
+    ) -> torch.Tensor:
+        """Mask disallowed continuations without transferring history to CPU.
+
+        Accepts either logits or log probabilities. Beam search applies this
+        *after* log-softmax to retain model likelihoods for ranking hypotheses.
+        """
+        if not self.enabled:
+            return scores
+        scores = scores.clone()
+        if self.suppress_tokens:
+            scores[:, list(self.suppress_tokens)] = float("-inf")
+        history = input_ids[:, 1:]
+        if history.shape[1] < self.min_new_tokens:
+            scores[:, eos_token_id] = float("-inf")
+
+        ngram_size = self.no_repeat_ngram_size
+        if ngram_size and history.shape[1] >= ngram_size:
+            banned = torch.zeros_like(scores, dtype=torch.bool)
+            if ngram_size == 1:
+                banned.scatter_(1, history, True)
+            else:
+                ngrams = history.unfold(1, ngram_size, 1)
+                prefix = history[:, -(ngram_size - 1):].unsqueeze(1)
+                matches = ngrams[:, :, :-1].eq(prefix).all(dim=-1)
+                # Multiple prefixes can end in the same token. Reduce with OR
+                # so a nonmatching prefix cannot overwrite a matching one.
+                banned.scatter_reduce_(
+                    1, ngrams[:, :, -1], matches, reduce="amax", include_self=True
+                )
+            scores.masked_fill_(banned, float("-inf"))
+        return scores
 
 
 # ============================================================================
@@ -592,6 +663,9 @@ def generate_with_kv_cache(
     top_p: float = 1.0,
     pad_token_id: int = 0,
     do_sample: bool = False,
+    min_new_tokens: int = 0,
+    no_repeat_ngram_size: int = 0,
+    suppress_tokens: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """
     Generate translation with KV caching for 2-3x speedup.
@@ -611,17 +685,23 @@ def generate_with_kv_cache(
             Prior versions always sampled, which diverged from the non-cached
             ``generate()`` default. Keeping ``do_sample=False`` makes greedy
             decoding deterministic and matches the reference path.
+        min_new_tokens: Minimum number of tokens after SOS before EOS is allowed.
+        no_repeat_ngram_size: Block repeated n-grams; 0 disables this heuristic.
+        suppress_tokens: Token IDs excluded from continuations (padding after
+            a completed sequence is unaffected).
 
     Returns:
         Generated sequences (batch, gen_len)
     """
     InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
+    constraints = GenerationConstraints(
+        min_new_tokens, no_repeat_ngram_size, tuple(suppress_tokens or ())
+    )
+    constraints.validate(max_length, getattr(model, "vocab_size", None))
     # Switch to eval for decoding but restore the caller's mode afterwards:
     # silently leaving the model in eval() after an in-training generation
     # (e.g. sampling translations during validation) would disable dropout for
     # the rest of the training run.
-    was_training = model.training
-    model.eval()
     device = src_input_ids.device
     batch_size = src_input_ids.shape[0]
 
@@ -632,6 +712,9 @@ def generate_with_kv_cache(
 
     InputValidator.validate_positive_float(temperature, "temperature", min_value=1e-8)
     temperature = max(0.01, float(temperature))
+
+    was_training = model.training
+    model.eval()
 
     logger.debug(
         "Generating with KV cache: batch_size=%d, max_length=%d", batch_size, max_length
@@ -652,6 +735,7 @@ def generate_with_kv_cache(
             do_sample=do_sample,
             device=device,
             batch_size=batch_size,
+            constraints=constraints,
         )
     finally:
         if was_training:
@@ -672,6 +756,7 @@ def _generate_with_kv_cache_impl(
     do_sample: bool,
     device: torch.device,
     batch_size: int,
+    constraints: GenerationConstraints,
 ) -> torch.Tensor:
     with torch.inference_mode():
         encoder_output = model.encoder(
@@ -728,6 +813,13 @@ def _generate_with_kv_cache_impl(
             logits, past_key_values = decoder_outputs
 
             next_token_logits = logits[:, -1, :] / temperature
+            next_token_logits = constraints.apply(
+                next_token_logits, generated[:, :generated_len], eos_token_id
+            )
+            if constraints.enabled and bool(
+                (~torch.isfinite(next_token_logits).any(dim=-1) & ~finished).any()
+            ):
+                raise ValueError("Generation constraints leave no valid continuation")
 
             if top_k is not None and top_k > 0:
                 top_k_val = min(top_k, next_token_logits.shape[-1])
@@ -743,17 +835,15 @@ def _generate_with_kv_cache_impl(
                 # Deterministic argmax path (matches default `generate()` semantics).
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
             else:
-                # Nan-safe softmax without three separate CPU-GPU syncs.
-                # nan_to_num replaces inf/nan in-place on the GPU; rows where
-                # every logit was masked out collapse to a uniform distribution
-                # which still gives a valid categorical sample.
+                # Normalize in FP32 and preserve -inf masks so forbidden
+                # tokens remain impossible even for very negative logits.
                 safe_logits = torch.nan_to_num(
-                    next_token_logits,
+                    next_token_logits.float(),
                     nan=0.0,
                     posinf=0.0,
-                    neginf=float("-1e30"),
+                    neginf=float("-inf"),
                 )
-                probs = F.softmax(safe_logits, dim=-1)
+                probs = torch.nan_to_num(F.softmax(safe_logits, dim=-1), nan=0.0)
                 # Guard against rows that summed to 0 (all -inf post-filtering)
                 # by falling back to argmax on the original logits for those rows.
                 row_sums = probs.sum(dim=-1, keepdim=True)
@@ -802,6 +892,9 @@ def generate_with_beam_search(
     sos_token_id: int = 1,
     eos_token_id: int = 2,
     pad_token_id: int = 0,
+    min_new_tokens: int = 0,
+    no_repeat_ngram_size: int = 0,
+    suppress_tokens: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """
     Generate translation with beam search.
@@ -810,8 +903,8 @@ def generate_with_beam_search(
     can also prefer short hypotheses. Tune ``length_penalty`` on validation
     data and compare against greedy decoding before deployment.
 
-    **Performance Note**: This recomputes the full decoder sequence at each
-    step (O(n²) per beam). Use ``generate_with_kv_cache`` for O(n) greedy.
+    Decoder self-attention uses KV caching; encoder activations and cross-
+    attention caches are shared across beams of the same source sentence.
     
     Args:
         model: Translation model
@@ -824,12 +917,19 @@ def generate_with_beam_search(
         sos_token_id: Start token ID
         eos_token_id: End token ID
         pad_token_id: Padding token ID
+        min_new_tokens: Minimum number of tokens after SOS before EOS is allowed.
+        no_repeat_ngram_size: Block repeated n-grams; 0 disables this heuristic.
+        suppress_tokens: Token IDs excluded from continuations.
     
     Returns:
         Best sequences (batch, max_length)
     """
     InputValidator.validate_positive_int(max_length, "max_length", min_value=1, max_value=2048)
     InputValidator.validate_positive_int(num_beams, "num_beams", min_value=1)
+    constraints = GenerationConstraints(
+        min_new_tokens, no_repeat_ngram_size, tuple(suppress_tokens or ())
+    )
+    constraints.validate(max_length, getattr(model, "vocab_size", None))
     # Switch to eval for decoding but restore the caller's mode afterwards
     # (see generate_with_kv_cache).
     was_training = model.training
@@ -855,6 +955,7 @@ def generate_with_beam_search(
             pad_token_id=pad_token_id,
             device=device,
             batch_size=batch_size,
+            constraints=constraints,
         )
     finally:
         if was_training:
@@ -874,6 +975,7 @@ def _generate_with_beam_search_impl(
     pad_token_id: int,
     device: torch.device,
     batch_size: int,
+    constraints: GenerationConstraints,
 ) -> torch.Tensor:
     with torch.inference_mode():
         # Encode source
@@ -944,6 +1046,9 @@ def _generate_with_beam_search_impl(
             
             # Convert to log probabilities
             next_token_scores = F.log_softmax(next_token_logits.float(), dim=-1)
+            next_token_scores = constraints.apply(
+                next_token_scores, input_ids, eos_token_id
+            )
             
             # Add beam scores
             next_token_scores = next_token_scores + beam_scores.reshape(-1, 1)
@@ -1024,6 +1129,10 @@ def _generate_with_beam_search_impl(
                 newly_done = finished_count.ge(num_beams)
             else:
                 newly_done = ~torch.isfinite(live_scores).any(dim=1)
+            if constraints.enabled:
+                # A constrained search can exhaust its live continuations
+                # before collecting num_beams finished hypotheses.
+                newly_done = newly_done | ~torch.isfinite(live_scores).any(dim=1)
             done = done | newly_done
 
             identity_beams = torch.arange(num_beams, device=device).expand(
@@ -1073,6 +1182,8 @@ def _generate_with_beam_search_impl(
         final_scores = torch.cat(
             [finished_scores, live_normalized_scores], dim=1
         )
+        if constraints.enabled and bool(~torch.isfinite(final_scores).any(dim=1).all()):
+            raise ValueError("Generation constraints leave no valid continuation")
         final_sequences = torch.cat(
             [finished_sequences, live_sequences], dim=1
         )

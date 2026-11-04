@@ -5,15 +5,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: lingolite
     volumes:
-      - ./models:/app/models
+      - ./models:/app/models:ro
       - ./data:/app/data
       - ./checkpoints:/app/checkpoints
-      - ./tokenizer:/app/tokenizer
+      - ./tokenizer:/app/tokenizer:ro
     environment:
       - LINGOLITE_MODEL_SIZE=small
-      - LINGOLITE_DEVICE=cuda
+      - LINGOLITE_DEVICE=cpu
+      - LINGOLITE_BIND_HOST=0.0.0.0
+      - LINGOLITE_MAX_BATCH_SIZE=8
+      - LINGOLITE_MAX_PENDING=128
+      - LINGOLITE_MAX_BATCH_TOKENS=8192
+      - LINGOLITE_BATCH_WAIT_MS=5
+      - LINGOLITE_REQUEST_TIMEOUT=30
       - LINGOLITE_ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO

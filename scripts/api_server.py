@@ -15,9 +15,9 @@ Supports dev modes via environment variables:
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
-import anyio
-import threading
+from pydantic import BaseModel, Field, field_validator, model_validator
+import asyncio
+from contextlib import asynccontextmanager
 import torch
 import time
 import logging
@@ -32,6 +32,8 @@ from lingolite.mobile_translation_model import (
 )
 from lingolite.translation_tokenizer import TranslationTokenizer
 from lingolite.utils import setup_logger, get_device
+from lingolite.inference import GenerationOptions, TranslationEngine, TranslationInput
+from lingolite.serving import TranslationService, ServiceBusyError, ServiceUnavailableError
 
 
 logger = setup_logger(name="lingolite_api", level=logging.INFO)
@@ -79,12 +81,22 @@ def _select_device(preference: str) -> torch.device:
         logger.warning("CUDA requested but unavailable. Using %s instead.", resolved)
     return resolved
 
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    try:
+        await startup_event()
+        yield
+    finally:
+        await shutdown_event()
+
+
 app = FastAPI(
     title="LingoLite Translation API",
     description="Mobile-optimized neural machine translation service",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # CORS configuration - defaults to localhost-only for safety
@@ -100,23 +112,23 @@ app.add_middleware(
 
 model: Optional[MobileTranslationModel] = None
 tokenizer: Optional[TranslationTokenizer] = None
-# Serializes generate calls across worker threads (the model mutates
-# train/eval mode and per-decode KV caches, so it is not re-entrant).
-_inference_lock = threading.Lock()
+translation_service: Optional[TranslationService] = None
 device: torch.device = torch.device("cpu")
 device_preference: str = "auto"
 configured_model_size: str = "small"
 current_model_size: Optional[str] = None
 
 
-class TranslationRequest(BaseModel):
-    text: str = Field(..., description="Text to translate", min_length=1, max_length=5000)
+class TranslationParameters(BaseModel):
     src_lang: str = Field("en", description="Source language code")
     tgt_lang: str = Field("es", description="Target language code")
     max_length: int = Field(128, description="Maximum output length", ge=10, le=512)
     method: str = Field("greedy", description="Generation method: greedy, beam, fast")
     num_beams: int = Field(4, description="Number of beams", ge=1, le=10)
     temperature: float = Field(1.0, description="Sampling temperature", gt=0.0, le=2.0)
+    length_penalty: float = Field(1.0, description="Beam length normalization", ge=0.0, le=5.0)
+    min_new_tokens: int = Field(0, description="Minimum tokens before EOS is allowed", ge=0, le=511)
+    no_repeat_ngram_size: int = Field(0, description="Block repeated n-grams; 0 disables", ge=0, le=32)
 
     @field_validator("method")
     @classmethod
@@ -124,6 +136,39 @@ class TranslationRequest(BaseModel):
         if v not in ["greedy", "beam", "fast"]:
             raise ValueError("Method must be one of: greedy, beam, fast")
         return v
+
+    @model_validator(mode="after")
+    def validate_lengths(self):
+        if self.min_new_tokens >= self.max_length:
+            raise ValueError("min_new_tokens must be smaller than max_length")
+        return self
+
+    def generation_options(self) -> GenerationOptions:
+        return GenerationOptions(**{
+            name: getattr(self, name) for name in GenerationOptions.__dataclass_fields__
+        })
+
+
+class TranslationRequest(TranslationParameters):
+    text: str = Field(..., description="Text to translate", min_length=1, max_length=5000)
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Text must contain non-whitespace characters")
+        return value
+
+
+class BatchTranslationRequest(TranslationParameters):
+    texts: List[str] = Field(..., description="Texts in result order", min_length=1, max_length=64)
+
+    @field_validator("texts")
+    @classmethod
+    def validate_texts(cls, values: List[str]) -> List[str]:
+        if any(not value.strip() or len(value) > 5000 for value in values):
+            raise ValueError("Each text must contain 1-5000 characters and not be blank")
+        return values
 
 
 class TranslationResponse(BaseModel):
@@ -142,6 +187,12 @@ class HealthResponse(BaseModel):
     tokenizer_loaded: bool
     device: str
     model_size: Optional[str] = None
+    outstanding_requests: int = 0
+    completed_batches: int = 0
+
+
+class BatchTranslationResponse(BaseModel):
+    translations: List[TranslationResponse]
 
 
 class ErrorResponse(BaseModel):
@@ -149,10 +200,13 @@ class ErrorResponse(BaseModel):
     detail: Optional[str] = None
 
 
-@app.on_event("startup")
 async def startup_event() -> None:
     global model, tokenizer, device, device_preference, configured_model_size, current_model_size
+    global translation_service
     logger.info("Starting LingoLite API server...")
+    if translation_service is not None:
+        await translation_service.close()
+        translation_service = None
 
     # Lightweight mode for tests/dev
     if os.getenv("LINGOLITE_DISABLE_STARTUP") == "1":
@@ -172,7 +226,7 @@ async def startup_event() -> None:
 
         # Tokenizer
         use_stub = os.getenv("LINGOLITE_USE_STUB_TOKENIZER") == "1"
-        tokenizer_path = Path("./tokenizer")
+        tokenizer_path = Path(os.getenv("LINGOLITE_TOKENIZER_PATH", "./tokenizer"))
         if use_stub:
             from lingolite.tokenizer_stub import StubTranslationTokenizer
 
@@ -180,7 +234,7 @@ async def startup_event() -> None:
             tokenizer = StubTranslationTokenizer(languages=["en", "es"])  # type: ignore
         else:
             if not tokenizer_path.exists():
-                raise RuntimeError("Tokenizer not found at ./tokenizer")
+                raise RuntimeError(f"Tokenizer not found at {tokenizer_path}")
             logger.info("Loading tokenizer...")
             tokenizer = TranslationTokenizer.from_pretrained(str(tokenizer_path))
         if tokenizer is None:
@@ -189,7 +243,7 @@ async def startup_event() -> None:
 
         # Model
         configured_model_size = _resolve_model_size()
-        model_checkpoint = Path("./models/translation_model.pt")
+        model_checkpoint = Path(os.getenv("LINGOLITE_MODEL_PATH", "./models/translation_model.pt"))
         if model_checkpoint.exists():
             logger.info(f"Loading model from {model_checkpoint}...")
             # SECURITY: Use weights_only=True to prevent arbitrary code execution
@@ -216,7 +270,7 @@ async def startup_event() -> None:
                 model.eval()
                 current_model_size = configured_model_size
             else:
-                raise RuntimeError("Model checkpoint not found at ./models/translation_model.pt")
+                raise RuntimeError(f"Model checkpoint not found at {model_checkpoint}")
 
         params = model.count_parameters()
         logger.info(
@@ -224,15 +278,30 @@ async def startup_event() -> None:
             current_model_size,
             params["total"] / 1e6,
         )
+        translation_service = TranslationService(
+            TranslationEngine(model, tokenizer, device),
+            max_batch_size=int(os.getenv("LINGOLITE_MAX_BATCH_SIZE", "8")),
+            max_pending=int(os.getenv("LINGOLITE_MAX_PENDING", "128")),
+            max_batch_tokens=int(os.getenv("LINGOLITE_MAX_BATCH_TOKENS", "8192")),
+            batch_wait_ms=float(os.getenv("LINGOLITE_BATCH_WAIT_MS", "5")),
+            request_timeout=float(os.getenv("LINGOLITE_REQUEST_TIMEOUT", "30")),
+        )
+        await translation_service.start()
         logger.info("LingoLite API server started successfully")
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
         raise
 
 
-@app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global translation_service, model, tokenizer, current_model_size
     logger.info("Shutting down LingoLite API server...")
+    if translation_service is not None:
+        await translation_service.close()
+        translation_service = None
+    model = None
+    tokenizer = None
+    current_model_size = None
 
 
 @app.get("/", response_model=dict)
@@ -241,7 +310,7 @@ async def root() -> Dict[str, Any]:
         "name": "LingoLite Translation API",
         "version": "0.1.0",
         "status": "running",
-        "endpoints": {"translate": "/translate", "health": "/health", "docs": "/docs"},
+        "endpoints": {"translate": "/translate", "batch": "/translate/batch", "health": "/health", "docs": "/docs"},
     }
 
 
@@ -253,6 +322,8 @@ async def health_check() -> HealthResponse:
         tokenizer_loaded=tokenizer is not None,
         device=str(device),
         model_size=current_model_size,
+        outstanding_requests=translation_service.outstanding if translation_service else 0,
+        completed_batches=translation_service.completed_batches if translation_service else 0,
     )
 
 
@@ -263,88 +334,52 @@ async def liveness() -> Dict[str, str]:
 
 @app.get("/health/readiness")
 async def readiness() -> Dict[str, str]:
-    if model is None or tokenizer is None:
+    if model is None or tokenizer is None or translation_service is None or not translation_service.ready:
         raise HTTPException(status_code=503, detail="Service not ready")
     return {"status": "ready"}
 
 
 @app.post("/translate", response_model=TranslationResponse)
 async def translate(request: TranslationRequest) -> TranslationResponse:
-    if model is None or tokenizer is None:
+    return (await _translate_texts([request.text], request))[0]
+
+
+@app.post("/translate/batch", response_model=BatchTranslationResponse)
+async def translate_batch(request: BatchTranslationRequest) -> BatchTranslationResponse:
+    return BatchTranslationResponse(translations=await _translate_texts(request.texts, request))
+
+
+async def _translate_texts(texts: List[str], request: TranslationParameters) -> List[TranslationResponse]:
+    if tokenizer is None or translation_service is None or not translation_service.ready:
         raise HTTPException(status_code=503, detail="Model or tokenizer not loaded")
-
-    # Echo mode for dev/testing
-    if os.getenv("LINGOLITE_ECHO_MODE") == "1":
-        return TranslationResponse(
-            translation=request.text,
-            src_lang=request.src_lang,
-            tgt_lang=request.tgt_lang,
-            method=request.method,
-            inference_time_ms=0.0,
-            input_length=len(request.text.split()),
-            output_length=len(request.text.split()),
-        )
-
-    start_time = time.time()
-
     if request.src_lang not in tokenizer.languages or request.tgt_lang not in tokenizer.languages:
         raise HTTPException(status_code=400, detail="Unsupported language code")
-
-    input_ids = tokenizer.encode(
-        text=request.text,
-        src_lang=request.src_lang,
-        tgt_lang=request.tgt_lang,
-        add_special_tokens=True,
-        max_length=512,
-    )
-    input_tensor = torch.tensor([input_ids], device=device)
-
-    def _run_generation() -> torch.Tensor:
-        # The model is not safe for concurrent generate calls (train/eval mode
-        # flips, KV-cache state), so serialize them behind a lock while keeping
-        # the event loop free to answer health checks and queue requests.
-        with _inference_lock, torch.inference_mode():
-            if request.method == "beam" and hasattr(model, "generate_beam"):
-                return model.generate_beam(
-                    src_input_ids=input_tensor,
-                    max_length=request.max_length,
-                    num_beams=request.num_beams,
-                    sos_token_id=tokenizer.sos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-            if request.method == "fast" and hasattr(model, "generate_fast"):
-                return model.generate_fast(
-                    src_input_ids=input_tensor,
-                    max_length=request.max_length,
-                    sos_token_id=tokenizer.sos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    temperature=request.temperature,
-                )
-            return model.generate(
-                src_input_ids=input_tensor,
-                max_length=request.max_length,
-                sos_token_id=tokenizer.sos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                temperature=request.temperature,
-            )
-
-    # Run the (CPU/GPU-bound, possibly multi-second) generation in a worker
-    # thread: a synchronous call here would block the entire asyncio event
-    # loop, freezing /health and every other request for the duration.
-    output_ids = await anyio.to_thread.run_sync(_run_generation)
-
-    translation = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
-    inference_time = (time.time() - start_time) * 1000.0
-
-    return TranslationResponse(
-        translation=translation,
-        src_lang=request.src_lang,
-        tgt_lang=request.tgt_lang,
-        method=request.method,
-        inference_time_ms=round(inference_time, 2),
-        input_length=len(input_ids),
-        output_length=len(output_ids[0]),
-    )
+    if os.getenv("LINGOLITE_ECHO_MODE") == "1":
+        return [TranslationResponse(
+            translation=text, src_lang=request.src_lang, tgt_lang=request.tgt_lang,
+            method=request.method, inference_time_ms=0.0,
+            input_length=len(text.split()), output_length=len(text.split()),
+        ) for text in texts]
+    started = time.perf_counter()
+    try:
+        results = await translation_service.translate_many(
+            [TranslationInput(text, request.src_lang, request.tgt_lang) for text in texts],
+            request.generation_options(),
+        )
+    except ServiceBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "1"}) from exc
+    except ServiceUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Translation deadline exceeded") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elapsed = round((time.perf_counter() - started) * 1000, 2)
+    return [TranslationResponse(
+        translation=result.translation, src_lang=request.src_lang, tgt_lang=request.tgt_lang,
+        method=request.method, inference_time_ms=elapsed,
+        input_length=result.input_length, output_length=result.output_length,
+    ) for result in results]
 
 
 @app.get("/languages", response_model=dict)
@@ -356,13 +391,13 @@ async def get_supported_languages() -> Dict[str, Any]:
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=ErrorResponse(error=exc.detail).dict())
+    return JSONResponse(status_code=exc.status_code, content=ErrorResponse(error=exc.detail).model_dump(), headers=exc.headers)
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error(f"Unhandled exception: {exc}")
-    return JSONResponse(status_code=500, content=ErrorResponse(error="Internal server error").dict())
+    return JSONResponse(status_code=500, content=ErrorResponse(error="Internal server error").model_dump())
 
 
 def main() -> None:
